@@ -20,15 +20,19 @@
   按知识卡经验加大，而不是靠反复 observe 轮询堆证据。
 """
 from __future__ import annotations
+from runtime import execution
 
 import argparse
+import sys
 import time
 from datetime import datetime
+from runtime import timed_call
 
 from common import (add_common_args, add_common_args_all_subcommands, capture,
                     next_targets, labeled_nodes, npm_identity,
                     connect, emit, evidence_paths, fail, guard_terminated,
-                    log_auto, rel, summarize_xml)
+                    log_auto, rel, summarize_xml, ROOT)
+import checkpoint
 
 
 def xy(v: str) -> tuple[int, int]:
@@ -69,7 +73,7 @@ def check_crash(d, package: str | None, evidence_dir) -> dict | None:
     except Exception:  # noqa: BLE001
         pass
     from logcat import detect as detect_crash
-    return detect_crash(d, target, related, evidence_dir)
+    return timed_call("crash_detection", detect_crash, d, target, related, evidence_dir)
 
 
 def watch_and_click(d, stages: list[list[str]], timeout_ms: int,
@@ -123,6 +127,294 @@ def watch_and_click(d, stages: list[list[str]], timeout_ms: int,
             "waited_ms": round((time.time() - t_start) * 1000)}
 
 
+SELECTOR_FLAGS = ("--text", "--id", "--rid", "--desc", "--xpath", "--uiautomator")
+
+
+def _reject_selector_misuse(p: argparse.ArgumentParser) -> None:
+    """拦住最常见的误用：给 tap/longclick 传文本选择器。
+
+    ⚠️ 这两个动作**只收坐标**，没有选择器形式 —— 坐标由本次 observe 的
+    next[].c 现场派生（比选择器更稳，可规避"同 rid 多态"）。
+    直接抛 argparse 默认错误（"the following arguments are required: --x, --y"）
+    只会让人以为"少传了参数"，故在此给出可执行的下一步。
+    """
+    argv = sys.argv[1:]
+    if not argv or argv[0] not in ("tap", "longclick"):
+        return
+    used = [flag for flag in SELECTOR_FLAGS if flag in argv]
+    if not used:
+        return
+    action = argv[0]
+    p.error(
+        f"{action} 不支持 {'/'.join(used)} —— 该动作只按坐标点击。\n"
+        f"  正确做法：先 `python tools/observe.py` 取 next[].c 坐标，\n"
+        f"           再 `python tools/act.py {action} --x <c0> --y <c1> --via \"rid=xxx\"`。\n"
+        f"  要按文字定位请用 observe 输出的坐标，不要猜选择器。"
+    )
+
+
+def _first(v) -> str:
+    """parse_expect 的值是**列表**（支持 `a|b`），这里取第一个用于定位。"""
+    if isinstance(v, list):
+        return v[0] if v else ""
+    return v or ""
+
+
+def _find_anchor(nodes: list[dict], labeled: list[tuple], sel: dict) -> dict | None:
+    """在当前屏幕里找一个锚点 → 返回 {x, y, label, how}。
+
+    降级链与路径图一致：rid → desc → text。
+    坐标**现场派生**（不写死），所以同一份路径图换设备/分辨率仍可用。
+    """
+    want_rid = _first(sel.get("rid")).split("/")[-1]
+    want_desc = _first(sel.get("desc"))
+    want_text = _first(sel.get("text"))
+
+    # full 模式给的是完整键；nav 模式是短键 r/d/t
+    for n in nodes:
+        c = n.get("center") or n.get("c")
+        if not c:
+            continue
+        rid = (n.get("rid") or n.get("r") or "").split("/")[-1]
+        desc = n.get("desc") or n.get("d") or ""
+        text = n.get("text") or n.get("t") or ""
+        if want_rid and rid == want_rid:
+            # 同 rid 多态：若同时给了 text，必须文字也对上（否则会点错项）
+            if want_text and want_text not in text:
+                # 文字可能在子节点里 → 用 nearby 文字兜底
+                near = ""
+                for lx, ly, lt in (labeled or []):
+                    if abs(lx - c[0]) <= 400 and abs(ly - c[1]) <= 80 and len(lt) > len(near):
+                        near = lt
+                if want_text not in near:
+                    continue
+                return {"x": c[0], "y": c[1], "label": want_text, "how": f"rid={want_rid}+text"}
+            return {"x": c[0], "y": c[1], "label": text or desc or want_rid,
+                    "how": f"rid={want_rid}"}
+    for n in nodes:
+        c = n.get("center") or n.get("c")
+        if not c:
+            continue
+        desc = n.get("desc") or n.get("d") or ""
+        if want_desc and want_desc in desc:
+            return {"x": c[0], "y": c[1], "label": desc, "how": f"desc={want_desc}"}
+    # text 兜底：必须**整串相等**，不能用 `in`。
+    # ⚠️ 用子串匹配会点到无关元素 —— 真实事故：找 `text=设置` 时命中了页面上
+    # 另一个含"设置"的容器（`layout_time_settings`），点到了完全不同的行，
+    # 落点跑到 TimeSlotSettingsActivity。宁可找不到（报 anchor_not_found），
+    # 也不要"猜一个差不多"的（那会把测试带到错误页面还继续跑）。
+    for n in nodes:
+        c = n.get("center") or n.get("c")
+        if not c:
+            continue
+        text = (n.get("text") or n.get("t") or "").strip()
+        if want_text and text == want_text:
+            return {"x": c[0], "y": c[1], "label": text, "how": f"text={want_text}"}
+    # 再退一步：可点容器自己没有文字、文字在子节点里 → 邻近且**相等**才算
+    for n in nodes:
+        c = n.get("center") or n.get("c")
+        if not c:
+            continue
+        for lx, ly, lt in (labeled or []):
+            if (want_text and lt.strip() == want_text
+                    and abs(lx - c[0]) <= 400 and abs(ly - c[1]) <= 80):
+                return {"x": c[0], "y": c[1], "label": lt, "how": f"text≈{want_text}"}
+    return None
+
+
+def run_steps(args) -> None:
+    """按路径图批量执行：起点 → 终点，每步校验检查点，不符即停。"""
+    import pathmap
+    # ⚠️ 整批必须**保证有结构化返回**：run.py 按"是否拿到结构化结果"判定
+    # 记录是否完整，异常逃逸会让 ledger 停在 started、把会话锁死（真实事故）。
+    try:
+        _run_steps_inner(args, pathmap)
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001
+        emit(False, {"error": f"act steps 失败: {type(e).__name__}: {e}",
+                     "hint": "本批未完成；已走的步骤见上面的逐步证据。"
+                             "修好后用 --resume-from N 接着跑。"})
+
+
+def _run_steps_inner(args, pathmap) -> None:
+    pkg = getattr(args, "package", None)
+    if not pkg:
+        try:
+            from db import current_session, get_db
+            si = current_session()
+            if si:
+                row = get_db().get_session(si)
+                pkg = (row or {}).get("package") if isinstance(row, dict) else None
+        except Exception:  # noqa: BLE001
+            pkg = None
+    if not pkg:
+        # 没有活动会话/没记包名 → 看路径图目录：只有一张图时无歧义，直接用
+        maps = sorted((ROOT / "knowledge" / "paths").glob("*.md"))
+        if len(maps) == 1:
+            pkg = maps[0].stem
+        elif maps:
+            emit(False, {"error": "有多个路径图，无法判断用哪张："
+                                  + ", ".join(m.stem for m in maps)
+                                  + "。加 --package <包名> 指定。"})
+            return
+    if not pkg:
+        emit(False, {"error": "找不到路径图 knowledge/paths/*.md"
+                              "（act steps 依赖路径图；没有图就先手动跑一遍采边）"})
+        return
+
+    path_map = ROOT / "knowledge" / "paths" / f"{pkg}.md"
+    if not path_map.is_file():
+        emit(False, {"error": f"路径图不存在: knowledge/paths/{pkg}.md"})
+        return
+    nodes = pathmap.load(path_map)
+    plan = pathmap.path_between(nodes, args.src, args.dst, args.max_hops)
+    if not plan["found"]:
+        emit(False, {"error": plan["reason"],
+                     "hint": "路径图里没有这条通路。先手动跑一遍，"
+                             "再用 session.py paths 采集边、paths-apply 写回。"})
+        return
+    if args.dry_run:
+        emit(True, {"dry_run": True, "route": plan["nodes"],
+                    "steps": [{"n": i, "from": s["from"], "to": s["to"],
+                               "anchor": s["anchor"], "selector": pathmap.edge_selector(s),
+                               "expect": pathmap.finish_expect(pathmap.find_node(nodes, s["to"]))}
+                              for i, s in enumerate(plan["steps"], 1)]})
+        return
+
+    d = connect(args.serial)
+    results = []
+    start = max(1, args.resume_from)
+
+    # 先认起点：不在起点就别硬走 —— 直接说清楚"你现在在哪、应该在哪"。
+    # 否则会在第 1 步报"找不到锚点"，让人误以为是路径图错了（实际是先没到起点）。
+    if start == 1:
+        _xml0 = d.dump_hierarchy()
+        _sig0 = npm_identity(_xml0, pkg)
+        _src = pathmap.find_node(nodes, args.src)
+        exp0 = pathmap.finish_expect(_src)
+        ck0 = checkpoint.evaluate(checkpoint.parse_expect(exp0),
+                                  activity=(d.app_current() or {}).get("activity"), sig=_sig0)
+        if ck0["checked"] and not ck0["ok"]:
+            _here = checkpoint.evaluate(
+                checkpoint.parse_expect(""), activity="", sig=_sig0)
+            emit(False, {"error": f"当前不在起点「{args.src}」",
+                         "expect": exp0, "missed": ck0["missed"],
+                         "hint": f"先导航到「{args.src}」再执行；"
+                                 f"或用 --from 指定你实际所在的节点。"
+                                 f"当前 activity={(d.app_current() or {}).get('activity')}"})
+            return
+
+    for i, step in enumerate(plan["steps"], 1):
+        if i < start:
+            results.append({"n": i, "from": step["from"], "to": step["to"],
+                            "status": "skipped"})
+            continue
+        sel = pathmap.edge_selector(step)
+        if not sel:
+            _rec = {"n": i, "from": step["from"], "to": step["to"],
+                    "status": "no_anchor", "reason": "这条边在路径图里没记锚点"}
+            _e = log_auto("act", f"act steps[{i}] 中止",
+                          f"第 {i} 步无法执行：这条边没记锚点",
+                          {"batch_step": i, "reason": "no_anchor"}, None, 0,
+                          datetime.now().isoformat(timespec="milliseconds"))
+            _rec["event_id"] = _e
+            results.append(_rec)
+            break
+
+        xml = d.dump_hierarchy()
+        full = summarize_xml(xml, mode="full", fg_package=pkg)
+        labeled = labeled_nodes(xml, pkg)
+        spec = checkpoint.parse_expect(sel)
+        hit = _find_anchor(full, labeled, spec)
+        if not hit:
+            # 锚点找不到也要落事件：否则整批没有任何事件 → ledger 判"无动作事件"。
+            _png, _xml, _meta = evidence_paths(args.dir, args.name or f"steps{i:02d}")
+            try:
+                capture(d, _png, _xml, _meta, extra={"batch_step": i, "anchor_missing": sel})
+            except Exception:  # noqa: BLE001
+                _png = None
+            _rec = {"n": i, "from": step["from"], "to": step["to"],
+                    "status": "anchor_not_found", "selector": sel,
+                    "reason": f"当前屏幕找不到锚点 {sel}"}
+            _e = log_auto("act", f"act steps[{i}] {step['from']} → {step['to']}",
+                          f"第 {i} 步失败：找不到锚点 {sel}",
+                          {"batch_step": i, "anchor": sel, "status": "anchor_not_found"},
+                          rel(_png) if _png else None, 0,
+                          datetime.now().isoformat(timespec="milliseconds"))
+            _rec["event_id"] = _e
+            results.append(_rec)
+            break
+
+        d.click(hit["x"], hit["y"])
+        time.sleep(args.settle / 1000)
+
+        # 每步都要落证据 —— 批量执行**不能**降低取证标准。
+        # 单步 act 的截图/dump 是 finding 绑定证据的前提；批量若只记一条汇总事件，
+        # 事后就无法用 --event-id 引用（真实缺陷：会话 328 finding 被拒）。
+        step_dir = None
+        png = xml2_path = None
+        try:
+            _png, _xml, _meta = evidence_paths(args.dir, args.name or f"steps{i:02d}")
+            capture(d, _png, _xml, _meta, extra={"batch_step": i,
+                                                 "from": step["from"], "to": step["to"]})
+            png, xml2_path, step_dir = _png, _xml, _meta
+        except Exception as e:  # noqa: BLE001
+            results.append({"n": i, "from": step["from"], "to": step["to"],
+                            "status": "evidence_failed", "reason": str(e)})
+            break
+
+        xml2 = xml2_path.read_text(encoding="utf-8")
+        act2 = None
+        try:
+            act2 = d.app_current().get("activity")
+        except Exception:  # noqa: BLE001
+            pass
+        sig2 = npm_identity(xml2, pkg)
+        tgt_node = pathmap.find_node(nodes, step["to"])
+        exp = pathmap.finish_expect(tgt_node)
+        ck = checkpoint.evaluate(checkpoint.parse_expect(exp), activity=act2, sig=sig2)
+        rec = {"n": i, "from": step["from"], "to": step["to"],
+               "anchor": step["anchor"], "selector": sel,
+               "how": hit["how"], "clicked": [hit["x"], hit["y"]],
+               "activity": act2, "expect": exp, "checkpoint": ck}
+        # 每步一条事件，绑该步证据 —— 这样 finding 能按步引用
+        eid = log_auto(
+            "act", f"act steps[{i}] {step['from']} → {step['to']}",
+            f"第 {i} 步 点 {hit['how']} ({hit['x']},{hit['y']}) → {act2}"
+            + (" · ✅检查点命中" if ck["ok"] else
+               " · ⚠️检查点未命中 " + "; ".join(ck["missed"])),
+            {"action": {"type": "tap", "x": hit["x"], "y": hit["y"],
+                        "via": sel, "why": args.why},
+             "activity": act2, "sig": sig2, "checkpoint": ck, "batch_step": i},
+            rel(png) if png else None, 0,
+            datetime.now().isoformat(timespec="milliseconds"))
+        rec["event_id"] = eid
+        if ck["checked"] and not ck["ok"]:
+            rec["status"] = "checkpoint_missed"
+            results.append(rec)
+            break
+        rec["status"] = "ok"
+        results.append(rec)
+
+    done = [r for r in results if r.get("status") == "ok"]
+    failed = next((r for r in results if r.get("status") not in ("ok", "skipped")), None)
+    payload = {
+        "route": plan["nodes"],
+        "steps": results,
+        "completed": len(done),
+        "total": len(plan["steps"]),
+        "ok": failed is None,
+    }
+    if failed:
+        payload["failed_at"] = failed["n"]
+        payload["hint"] = (f"第 {failed['n']} 步没过（{failed['status']}）："
+                           f"{failed.get('reason') or failed.get('checkpoint', {}).get('missed')}。"
+                           f"修好后可 `act.py steps --from ... --to ... --resume-from {failed['n']}` 接着跑。"
+                           "先判断是临时弹窗（关掉继续）还是用例要的东西没了（停下来记录）。")
+    emit(True, payload)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="act：执行动作并回传动作后画面")
     # --settle / --perm-action / --perm 已在 add_common_args 里定义
@@ -140,6 +432,14 @@ def main() -> None:
                             "如 rid=com.android.permissioncontroller:id/permission_allow_button|text=允许")
         s.add_argument("--watch-timeout", type=int, default=8000, dest="watch_timeout",
                        help="watch 总窗口毫秒数，默认 8000（系统权限框约 6s 自行消失，必须一次处理完）")
+        if name == "tap":
+            s.add_argument("--repeat", type=int, default=1,
+                           help="连点次数，默认 1。用于滚轮「点上方/下方一格=±1」这类"
+                                "同一位置重复点按：N 次点按在**一个进程内**完成，"
+                                "不要拆成 N 次工具调用（每次冷启动 3-6s，会撞命令超时，"
+                                "超时会让动作执行了却没记账 → 会话被判 recording incomplete）。")
+            s.add_argument("--gap", type=int, default=120,
+                           help="--repeat 时每次点按之间的间隔毫秒，默认 120")
 
     s = sub.add_parser("input")
     s.add_argument("--x", type=int, required=True)
@@ -171,10 +471,26 @@ def main() -> None:
     s.add_argument("--code", type=int, required=True)
     s.add_argument("--why", default=None)
 
+    # 批量走**路径图里已有的边**。第一次走某条路时用不着（边还没采到），
+    # 第二次以及同事复用同一 SKILL 时，就不必再逐步 "看一眼 → 想一下 → 点一下"。
+    s = sub.add_parser("steps", help="按路径图批量执行一串已知步骤（带检查点）")
+    s.add_argument("--from", dest="src", required=True, help="起点节点名（路径图里的 ## 名）")
+    s.add_argument("--to", dest="dst", required=True, help="目标节点名")
+    s.add_argument("--max-hops", type=int, default=12, dest="max_hops")
+    s.add_argument("--dry-run", action="store_true", dest="dry_run",
+                   help="只打印计划，不碰设备")
+    s.add_argument("--resume-from", type=int, default=1, dest="resume_from",
+                   help="从第 N 步开始（失败后修好接着跑，默认 1）")
+    s.add_argument("--why", default=None)
+
     # 让 --serial/--dir/--name 在子命令前后都能写（两种位置解析后合并）
     add_common_args_all_subcommands(p)
+    _reject_selector_misuse(p)
     args = p.parse_args()
     guard_terminated(f"act {args.action}")   # 会话已因崩溃终止 → 拒绝执行
+    if args.action == "steps":
+        run_steps(args)
+        return
     via = getattr(args, "via", None)
     why = getattr(args, "why", None)
 
@@ -197,35 +513,46 @@ def main() -> None:
 
     t0 = time.perf_counter()
     started_at = datetime.now().isoformat(timespec="milliseconds")
+    execution("may_have_executed")
     try:
         if args.action in ("tap", "longclick"):
-            (d.long_click if args.action == "longclick" else d.click)(args.x, args.y)
+            repeat = getattr(args, "repeat", 1) or 1
+            gap = getattr(args, "gap", 120) or 0
+            fn = d.long_click if args.action == "longclick" else d.click
+            for i in range(repeat):
+                if i:
+                    time.sleep(gap / 1000)
+                timed_call("action", fn, args.x, args.y)
             action = {"type": args.action, "x": args.x, "y": args.y}
+            if repeat > 1:
+                action["repeat"] = repeat
+                action["gap_ms"] = gap
         elif args.action == "input":
             if not args.no_click:
-                d.click(args.x, args.y)
-                time.sleep(0.3)
-            d.send_keys(args.text, clear=not args.append)
+                timed_call("action", d.click, args.x, args.y)
+                timed_call("input_focus_wait", time.sleep, 0.3)
+            timed_call("action", d.send_keys, args.text, clear=not args.append)
             action = {"type": "input", "x": args.x, "y": args.y, "text": args.text,
                       "mode": "append" if args.append else "overwrite"}
         elif args.action == "swipe":
             x1, y1 = xy(args.src)
             x2, y2 = xy(args.dst)
-            d.swipe(x1, y1, x2, y2, args.dur / 1000)
+            timed_call("action", d.swipe, x1, y1, x2, y2, args.dur / 1000)
             action = {"type": "swipe", "from": [x1, y1], "to": [x2, y2], "dur_ms": args.dur}
         elif args.action == "back":
-            d.press("back")
+            timed_call("action", d.press, "back")
             action = {"type": "back"}
         elif args.action == "home":
-            d.press("home")
+            timed_call("action", d.press, "home")
             action = {"type": "home"}
         else:
-            d.shell(f"input keyevent {args.code}")
+            timed_call("action", d.shell, f"input keyevent {args.code}")
             action = {"type": "key", "code": args.code}
     except Exception as e:  # noqa: BLE001
         fail(f"动作执行失败: {e}")
 
-    time.sleep(args.settle / 1000)  # 稳定窗口（--settle 可调），画面是否稳定由 AI 按 after 判断
+    execution("executed")
+    timed_call("settle_wait", time.sleep, args.settle / 1000)
 
     png, xml, meta = evidence_paths(args.dir, args.name)
     # ⚠️ 必须按 action 分支求值：字典字面量会**同时**求值所有 value，
@@ -233,6 +560,9 @@ def main() -> None:
     # → AttributeError 让除 input 外的所有动作在采集阶段直接崩（真实事故）。
     if args.action in ("tap", "longclick"):
         detail = f"{'点击' if args.action == 'tap' else '长按'} ({args.x},{args.y})"
+        _rep = getattr(args, "repeat", 1) or 1
+        if _rep > 1:
+            detail += f" ×{_rep}"
     elif args.action == "input":
         detail = (f"输入 {args.text!r}"
                   + ("（追加）" if getattr(args, "append", False) else ""))
@@ -261,8 +591,8 @@ def main() -> None:
         #     （先点 App 提示框"知道了"，再点系统权限框"全部允许"）
         stages = [[s for s in stage.split("|") if s.strip()]
                   for stage in watch_spec.split(";;") if stage.strip()]
-        watch_result = watch_and_click(d, stages,
-                                       getattr(args, "watch_timeout", 8000))
+        watch_result = timed_call("watch", watch_and_click, d, stages,
+                                  getattr(args, "watch_timeout", 8000))
         got = watch_result.get("clicked") or []
         if got:
             detail += " · watch命中 " + ", ".join(
@@ -279,7 +609,8 @@ def main() -> None:
         si = current_session()
         intent = get_db().get_perm_intent(si) if si else None
         import perm as _perm
-        perm_result = _perm.handle(d, intent["action"] if intent else None)
+        perm_result = timed_call("permission", _perm.handle,
+                                 d, intent["action"] if intent else None)
     except Exception as e:  # noqa: BLE001
         perm_result = {"error": str(e)}
     if perm_result and perm_result.get("detected"):
@@ -329,7 +660,6 @@ def main() -> None:
             except Exception:  # noqa: BLE001
                 pass
 
-    duration_ms = round((time.perf_counter() - t0) * 1000)
 
     # ⚠️ 事件必须在**补齐 perm/watch 等附加字段之后**再落库：
     # 这些字段是链路卡回放的关键（🎯 权限意图声明、🔐 权限框响应），
@@ -346,6 +676,21 @@ def main() -> None:
     _sig = npm_identity(xml.read_text(encoding="utf-8"),
                         None if getattr(args, "no_filter", False) else info.get("package"))
     info = {**info, "sig": _sig}
+    # 检查点：由工具判"这一步落在预期位置没有"。
+    # 让 AI 不必再读 dump 自己认页面（那是会话时长的大头 —— 实测 58~64% 花在
+    # 两次调用之间的判断上）。命中与否都返回，但**不阻断**：工具只报事实，
+    # 由 AI 决定继续还是修正（测试里"实际发生了什么"比"帮它走通"重要）。
+    _ck = checkpoint.evaluate(checkpoint.parse_expect(getattr(args, "expect", None)),
+                              activity=info.get("activity"), sig=_sig)
+    if _ck["checked"]:
+        info = {**info, "checkpoint": _ck}
+        detail += (" · ✅检查点命中" if _ck["ok"]
+                   else " · ⚠️检查点未命中: " + "; ".join(_ck["missed"]))
+    _transient = checkpoint.detect_transient(_sig)
+    if _transient:
+        info = {**info, "transient_popup": _transient}
+    duration_ms = round((time.perf_counter() - t0) * 1000)
+    info["duration_scope"] = "core operation through capture/signature/crash check; excludes connection, event write and response"
     log_auto("act", f"act {args.action}", detail, info, rel(png), duration_ms, started_at)
 
     nodes = summarize_xml(xml.read_text(encoding="utf-8"),
@@ -375,6 +720,18 @@ def main() -> None:
                   + "] " + detail)
     if alert:
         payload["alert"] = alert
+    if _ck["checked"]:
+        payload["checkpoint"] = _ck
+        if not _ck["ok"]:
+            payload["checkpoint_hint"] = (
+                "⚠️ 落点与预期不符：未命中 " + "; ".join(_ck["missed"]) + "。"
+                "先判断是「多余的临时弹窗」（不影响主流程 → 关掉继续）还是"
+                "「用例要的东西不存在了」（主流程被改 → 停止并如实记录）。")
+    if _transient:
+        payload["transient_popup"] = _transient
+        payload["transient_hint"] = (
+            "检测到已知临时弹窗，可关闭后继续（不影响主流程）。"
+            "若它每次都出现，则应作为流程节点记入路径图，而非当弹窗处理。")
     if perm_result and perm_result.get("detected"):
         payload["permission"] = perm_result
         if not (perm_result.get("clicks") or []):

@@ -73,6 +73,7 @@ adb devices -l                              # 设备在线且已授权
 | `tools/logcat.py` | 崩溃/ANR 取证：分级（被测/关联/无关）、自动抓崩溃前 20s 日志 |
 | `tools/vision.py` | 可选视觉通道：OpenAI 兼容多模态模型问图（测试台「视觉模型」页配置） |
 | `tools/cleanup.py` | 证据/日志轮转（--days，防 storage 膨胀） |
+| `tools/run.py` / `tools/audit.py` | 独立启动调用、事件对账与子进程/阶段耗时报告；正式性能基准使用 |
 
 所有 observe/act/read 调用自动归档证据到 `storage/evidence/`（`--name` 可省略，
 自动派生 `<会话id>/step<N>`），并自动写入当前会话事件流。
@@ -82,12 +83,34 @@ adb devices -l                              # 设备在线且已授权
 ```powershell
 .venv\Scripts\python tools\session.py start --title "冒烟" --input "口述的用例原文"
 # …… AI 调 observe/act/read 执行（自动记录事件流）……
+.venv\Scripts\python tools\session.py finding --status PASS --event-id <证据事件ID> --expect "<预期>" --actual "<实际>"
+# 每条预期分别记录 finding，全部实际通过后收尾
 .venv\Scripts\python tools\session.py finish --status PASS --summary "全过"
 .venv\Scripts\python webui.py        # http://127.0.0.1:8900 查看时间线/证据/知识库
 ```
 
 数据库 `storage/sessions.db` 三张表：`sessions`（会话）/ `events`（工具调用事件流，
-自动写入）/ `findings`（断言结论）。界面按"会话 → 时间线 → 截图证据"组织。
+自动写入）/ `findings`（断言结论），另有用例表和断言证据关联表。界面按"会话 → 时间线 → 截图证据"组织，断言可跳转关联事件。
+
+### 可信记录与性能基准
+
+PASS/FAIL/WARN 断言必须显式绑定本会话证据：`session.py finding --event-id <ID> ...`；
+多个证据重复传 `--event-id`，ID 来自工具返回的 `event_ids`。收尾在校验后事务提交，
+拒绝时不更新结论与用例统计。记录失败会明确报错，动作可能已经执行，禁止直接重放。
+
+基准用 `tools\run.py act ...` 等方式替代直接调用，再用
+`tools\audit.py --session-id <ID>` 对账。详细使用、计时范围与隔离方式见
+[环境与工具参数](docs/环境与工具参数.md)。这些是可信记录与测量基础设施，
+尚未据此完成真机基线或证明提速收益。
+调用失败与记录完整性分别报告：`audit.ok` 只表示完整性，拒绝/失败尝试单列；
+计时默认后台落盘，正常返回不展开。逐步动作接口保留，finding 证据绑定和 finish 硬校验为有意收紧的约束。
+
+隔离回归：
+
+```powershell
+.venv\Scripts\python -m unittest discover -s tests -p test_trusted_execution.py -v
+.venv\Scripts\python tests\test_crash_pipeline.py
+```
 
 ## 目录
 

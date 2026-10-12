@@ -2,9 +2,28 @@
 """回归（第二轮 Review）：用带真实 logcat 前缀的样本测崩溃取证全链路。"""
 import sys
 from pathlib import Path
+import atexit
+import os
+import tempfile
 
-sys.path.insert(0, "tools")
+TEST_STORAGE = tempfile.TemporaryDirectory(prefix="android-crash-test-")
+os.environ["ANDROID_TEST_STORAGE"] = TEST_STORAGE.name
+TOOLS = Path(__file__).resolve().parents[1] / "tools"
+STORAGE = Path(TEST_STORAGE.name)
+sys.path.insert(0, str(TOOLS))
 import logcat  # noqa: E402
+
+
+def cleanup_test_storage():
+    import db
+    if db._DB is not None:
+        conn = getattr(db._DB._local, "conn", None)
+        if conn is not None:
+            conn.close()
+    TEST_STORAGE.cleanup()
+
+
+atexit.register(cleanup_test_storage)
 
 # 真实格式：时间 PID TID 级别 Tag: 消息（时间在行首，FATAL 在行中）
 RAW = (
@@ -38,9 +57,9 @@ class FakeD:
 
 
 d = FakeD()
-for f in Path("storage").glob(".crash_seen_*"):
+for f in STORAGE.glob(".crash_seen_*"):
     f.unlink(missing_ok=True)
-ev = Path("storage/evidence/_smoke_crash3")
+ev = STORAGE / "evidence" / "_smoke_crash3"
 
 # 1. 真实前缀样本：process/pid/time 全部提取成功（上一轮的断点就在这）
 entries = logcat.parse_entries(RAW)
@@ -67,7 +86,7 @@ assert log_file.exists() and "context line" in log_file.read_text(encoding="utf-
 print("2 detect_20s_context_ok  since=16:59:50.123  log 已落盘")
 
 # 3. 崩溃风暴：缓冲区追加第 2 条（同 App 同秒、PID 不同）→ 不被吞
-for f in Path("storage").glob(".crash_seen_*"):
+for f in STORAGE.glob(".crash_seen_*"):
     f.unlink(missing_ok=True)
 
 
@@ -107,14 +126,14 @@ db.clear_current()
 print("5 session_isolated_ok")
 
 # 清理
-for f in Path("storage").glob(".crash_seen_*"):
+for f in STORAGE.glob(".crash_seen_*"):
     f.unlink(missing_ok=True)
 import shutil  # noqa: E402
 shutil.rmtree(ev, ignore_errors=True)
 
 # 6. ANR 分级（复审 P0：ANR 块无 Process: 行，进程名只能从 "ANR in <pkg>" 提取；
 #    缺此分支被测 App ANR 会被判 other 而放过——SKILL.md 承诺 target 含 ANR）
-for f in Path("storage").glob(".crash_seen_*"):
+for f in STORAGE.glob(".crash_seen_*"):
     f.unlink(missing_ok=True)
 ANR_RAW = (
     "--------- beginning of crash\n"
@@ -147,16 +166,16 @@ print("7 overlay_not_target_ok")
 import subprocess  # noqa: E402
 import db  # noqa: E402
 
-for f in Path("storage").glob(".crash_seen_*"):
+for f in STORAGE.glob(".crash_seen_*"):
     f.unlink(missing_ok=True)
 sid2 = db.get_db().start_session("resume-guard", "t")
 db.set_current(sid2)
 db.get_db().terminate_session(sid2, "FATAL EXCEPTION test")
-r = subprocess.run([sys.executable, "tools/session.py", "resume", "--id", str(sid2)],
+r = subprocess.run([sys.executable, str(TOOLS / "session.py"), "resume", "--id", str(sid2)],
                    capture_output=True)
 assert r.returncode == 1, f"无 note 的 resume 应被拒绝: {r.returncode}"
 assert db.get_db().get_termination(sid2), "被拒的 resume 清掉了终态——守门可被两次调用绕过"
-r = subprocess.run([sys.executable, "tools/session.py", "resume", "--id", str(sid2),
+r = subprocess.run([sys.executable, str(TOOLS / "session.py"), "resume", "--id", str(sid2),
                     "--note", "confirmed"], capture_output=True)
 assert r.returncode == 0, r.stderr
 assert db.get_db().get_termination(sid2) is None
@@ -165,7 +184,7 @@ print("8 resume_guard_ok  拒绝时终态保留，带 note 才解锁")
 # ── 9. Review 回归：崩溃分级取最高危（不能只看最新一条）──────────────
 # 场景：被测包先崩、随后一个无关包崩。旧逻辑取最新 → other 不阻断，
 # 且那条 target 已被写入指纹文件、永不再上报。
-for f in Path("storage").glob(".crash_seen_*"):
+for f in STORAGE.glob(".crash_seen_*"):
     f.unlink(missing_ok=True)
 MIX_SAME_BATCH = (
     "09-22 10:00:00.000  1000  1000 E AndroidRuntime: FATAL EXCEPTION: main\n"
@@ -235,7 +254,7 @@ _d.delete_session(_s_fin)
 _d.delete_session(_s_run)
 
 # ── 12. Review 回归：同级崩溃 tie-break 取最新（不是最旧）────────────
-for f in Path("storage").glob(".crash_seen_*"):
+for f in STORAGE.glob(".crash_seen_*"):
     f.unlink(missing_ok=True)
 TIE_RAW = (
     "09-22 10:00:00.000  1000  1000 E AndroidRuntime: FATAL EXCEPTION: main\n"
@@ -459,7 +478,7 @@ assert npm_identity("<bad", fg_package="com.app") == [], "坏 XML 不抛异常"
 print("20 npm_identity_ok  屏幕身份签名（去重/按前台包过滤/坏XML不抛）")
 
 # 清理
-for f in Path("storage").glob(".crash_seen_*"):
+for f in STORAGE.glob(".crash_seen_*"):
     f.unlink(missing_ok=True)
 db.get_db()._conn().execute("DELETE FROM events WHERE session_id=?", (sid2,))
 db.get_db()._conn().execute("DELETE FROM sessions WHERE id=?", (sid2,))

@@ -16,7 +16,8 @@ from __future__ import annotations
 import argparse
 
 from common import (add_common_args_all_subcommands, connect, emit, fail,
-                    log_auto)
+                    log_auto, guard_terminated)
+from runtime import execution
 
 PERMS = {
     "camera": "android.permission.CAMERA",
@@ -72,11 +73,13 @@ def main() -> None:
     # --serial 写在子命令前后都能解析（与其他工具一致）
     add_common_args_all_subcommands(p)
     args = p.parse_args()
+    guard_terminated(f"state {args.cmd}")
     try:
         d = connect(args.serial)
     except Exception as e:  # noqa: BLE001
         fail(f"设备连接失败: {e}")
 
+    execution("may_have_executed")
     try:
         if args.cmd in ("grant", "revoke"):
             perm = resolve_perm(args.perm)
@@ -84,6 +87,7 @@ def main() -> None:
             granted = _perm_granted(d, args.package, perm)
             ok = granted if args.cmd == "grant" else not granted
             detail = f"pm {args.cmd} {args.package} {perm} → {'granted' if granted else 'not granted'}"
+            execution("executed")
             log_auto("state", f"state {args.cmd}", detail,
                      {"perm": perm, "ok": ok, "verified": True})
             if ok:
@@ -101,15 +105,18 @@ def main() -> None:
         elif args.cmd == "clear":
             out = (d.shell(f"pm clear {args.package}").output or "").strip()
             ok = "Success" in out
+            execution("executed")
             log_auto("state", "state clear", f"pm clear {args.package}", {"ok": ok})
             emit(ok, {"output": out, "hint": "应用已回到首次使用态（含外部 Android/data）"})
         elif args.cmd == "start":
             comp = f"{args.package}/{args.activity}" if args.activity else args.package
             d.app_start(args.package, args.activity) if args.activity else d.app_start(args.package)
+            execution("executed")
             log_auto("state", "state start", f"启动 {comp}", {"ok": True})
             emit(True, {"started": comp, "hint": "冷启动后旋转锁定可能被解锁，注意 rotation"})
         elif args.cmd == "stop":
             d.app_stop(args.package)
+            execution("executed")
             log_auto("state", "state stop", f"force-stop {args.package}", {"ok": True})
             emit(True, {"stopped": args.package})
     except Exception as e:  # noqa: BLE001

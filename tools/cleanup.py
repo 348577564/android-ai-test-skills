@@ -19,39 +19,41 @@ from __future__ import annotations
 import argparse
 import time
 from pathlib import Path
+import sqlite3
+from runtime import STORAGE_DIR
+from common import rel
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
 def _db_referenced(rel_prefix: str) -> list[str]:
     """返回数据库中引用了该路径前缀的会话标识（如 `#275`）。"""
-    try:
-        import sys
-        sys.path.insert(0, str(ROOT / "tools"))
-        from db import get_db
-    except Exception:  # noqa: BLE001
-        return []
-    try:
-        rows = get_db()._conn().execute(
-            "select distinct session_id from events"
-            " where evidence like ?", (f"%{rel_prefix}%",)).fetchall()
-        return [f"#{r['session_id']}" for r in rows]
-    except Exception:  # noqa: BLE001
-        return []
+    from db import get_db
+    prefix = Path(rel_prefix)
+    prefix = (prefix if prefix.is_absolute() else ROOT / prefix).resolve()
+    rows = get_db()._conn().execute(
+        "SELECT session_id, evidence FROM events WHERE evidence IS NOT NULL").fetchall()
+    users = set()
+    for row in rows:
+        evidence = Path(row["evidence"])
+        evidence = (evidence if evidence.is_absolute() else ROOT / evidence).resolve()
+        if evidence == prefix or evidence.is_relative_to(prefix):
+            users.add(row["session_id"])
+    return [f"#{sid}" for sid in sorted(users)]
 
 
 def rm_dir(name: str, force: bool = False) -> int:
     """删 storage/evidence/<name>，**先查数据库引用**。返回退出码。"""
-    target = (ROOT / "storage" / "evidence" / name).resolve()
-    root = (ROOT / "storage" / "evidence").resolve()
+    target = (STORAGE_DIR / "evidence" / name).resolve()
+    root = (STORAGE_DIR / "evidence").resolve()
     if not target.is_relative_to(root) or target == root:
         print(f"拒绝：{name} 不是 evidence 下的子目录")
         return 1
     if not target.is_dir():
-        print(f"不存在：{target.relative_to(ROOT)}")
+        print(f"不存在：{target}")
         return 1
 
-    users = _db_referenced(f"evidence/{name}/")
+    users = _db_referenced(str(target))
     if users and not force:
         print(f"拒绝删除 storage/evidence/{name} —— 数据库里这些会话还引用着它："
               f"{', '.join(users)}")
@@ -89,12 +91,12 @@ def main() -> None:
     try:
         from db import current_session
         cur = current_session()
-    except Exception:  # noqa: BLE001
-        cur = None
+    except (OSError, ValueError) as error:
+        raise ValueError(f"Cannot verify current session before cleanup: {error}") from error
 
     removed = kept = 0
     for name in ("evidence", "logs"):
-        root = ROOT / "storage" / name
+        root = STORAGE_DIR / name
         if not root.is_dir():
             continue
         # 当前会话的证据目录整目录保护（跑一半被清掉=取证断链）
@@ -109,13 +111,12 @@ def main() -> None:
                 kept += 1
                 continue
             # ⚠️ 还被数据库引用着的证据**不删** —— 删了记录页就空白
-            rel = f.relative_to(ROOT).as_posix()
-            if _db_referenced(rel):
+            if _db_referenced(rel(f)):
                 kept += 1
                 continue
             if args.dry:
                 removed += 1
-                print(f"[dry] 将删 {f.relative_to(ROOT)}")
+                print(f"[dry] 将删 {f}")
                 continue
             f.unlink(missing_ok=True)
             removed += 1
@@ -129,4 +130,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (OSError, ValueError, sqlite3.Error) as error:
+        print(f"Cleanup refused/failed: {error}")
+        raise SystemExit(1)

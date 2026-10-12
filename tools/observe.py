@@ -12,6 +12,7 @@ from common import (add_common_args, backfill_package, capture, connect, emit,
                     rel, summarize_xml)
 import time
 from datetime import datetime
+from runtime import timed_call, execution
 
 
 def main() -> None:
@@ -29,6 +30,7 @@ def main() -> None:
     png, xml, meta = evidence_paths(args.dir, args.name)
     t0 = time.perf_counter()
     started_at = datetime.now().isoformat(timespec="milliseconds")
+    execution("may_have_executed")
 
     # 权限弹窗：按会话级意图自动响应（在截图前处理，弹窗约 6s 会自行消失）
     perm_result = None
@@ -37,7 +39,8 @@ def main() -> None:
         si = current_session()
         intent = get_db().get_perm_intent(si) if si else None
         import perm as _perm
-        perm_result = _perm.handle(d, intent["action"] if intent else None)
+        perm_result = timed_call("permission", _perm.handle,
+                                 d, intent["action"] if intent else None)
     except Exception as e:  # noqa: BLE001
         perm_result = {"error": str(e)}
 
@@ -45,7 +48,7 @@ def main() -> None:
         info = capture(d, png, xml, meta)
     except Exception as e:  # noqa: BLE001
         fail(f"采集失败: {e}")
-    duration_ms = round((time.perf_counter() - t0) * 1000)
+    execution("executed")
     detail = "观察屏幕"
     if perm_result and perm_result.get("detected"):
         clk = ", ".join(c["text"] for c in perm_result.get("clicks") or [])
@@ -57,7 +60,6 @@ def main() -> None:
     info = {**info, "sig": npm_identity(
         xml.read_text(encoding="utf-8"),
         None if getattr(args, "no_filter", False) else info.get("package"))}
-    log_auto("observe", "observe", detail, info, rel(png), duration_ms, started_at)
 
     # 崩溃检测：observe 也必须做。
     # ⚠️ 真实事故：App 启动即崩时 AI 只会反复 observe（还没机会 act），
@@ -90,6 +92,10 @@ def main() -> None:
                     get_db().terminate_session(sid, v["message"])
             except Exception:  # noqa: BLE001
                 pass
+    duration_ms = round((time.perf_counter() - t0) * 1000)
+    info["duration_scope"] = "core operation through capture/signature/crash check; excludes connection, event write and response"
+    log_auto("observe", "observe", detail, info, rel(png), duration_ms, started_at)
+    if crash and crash.get("new"):
         # 把 crash 标记载入事件流，使 finish 的 crash_events 计数正确
         log_auto("crash", "observe crash",
                  f"⚠️{v['message']}",

@@ -5,22 +5,46 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sqlite3
 import sys
 import time
+import os
+import runtime
 from datetime import datetime
 from pathlib import Path
+from runtime import CALL_ID, EVENT_IDS, STORAGE_DIR, recording_issues, stage, timed, timing_snapshot
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_EVIDENCE_DIR = ROOT / "storage" / "evidence"
+DEFAULT_EVIDENCE_DIR = STORAGE_DIR / "evidence"
+
+
+def ensure_utf8_stdio() -> None:
+    """把 stdout/stderr 切到 UTF-8。
+
+    ⚠️ 必须在 **argparse 解析之前**生效：用法错误（如给 tap 传 --text）
+    会由 argparse 直接写 stderr，内容含中文。若沿用控制台默认编码（Windows
+    上是 GBK），调用方按 UTF-8 解码时会抛 UnicodeDecodeError，把一个
+    "参数写错" 放大成 "输出无法解析"。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
+
+
+ensure_utf8_stdio()
 
 
 def connect(serial: str | None):
     """延迟导入 uiautomator2：无依赖环境也能 --help / 查看用法。"""
     try:
-        import uiautomator2 as _u2
+        with stage("device_import"):
+            import uiautomator2 as _u2
     except ImportError:
         fail("缺依赖：先建环境 pip install -r requirements.txt")
-    return _u2.connect(serial) if serial else _u2.connect()
+    with stage("device_connect"):
+        return _u2.connect(serial) if serial else _u2.connect()
 
 
 def try_connect(serial: str | None):
@@ -115,7 +139,7 @@ def auto_name() -> str:
         sid = current_session() or "loose"
     except Exception:  # noqa: BLE001
         sid = "loose"
-    seq_file = ROOT / "storage" / ".evidence_seq"
+    seq_file = STORAGE_DIR / ".evidence_seq"
     lock = str(seq_file) + ".lock"
     seq_file.parent.mkdir(parents=True, exist_ok=True)
     n = 1
@@ -165,16 +189,42 @@ def evidence_paths(base_dir: str | None, name: str | None) -> tuple[Path, Path, 
 
 def log_auto(kind: str, tool: str, detail: str, data: dict | None = None,
              evidence: str | None = None, duration_ms: int | None = None,
-             started_at: str | None = None) -> None:
-    """自动记入当前会话事件流。失败静默——记录不该阻断执行。"""
+             started_at: str | None = None) -> int | None:
+    """Persist an event or explicitly stop; an executed action must not be replayed."""
+    sid = None
     try:
         from db import current_session, get_db
         sid = current_session()
         if sid:
-            get_db().log_event(sid, kind, tool, detail, data, evidence,
-                               duration_ms, started_at)
-    except Exception:
-        pass
+            with stage("event_write"):
+                eid = get_db().log_event(
+                    sid, kind, tool, detail,
+                    {**(data or {}), "timing": timing_snapshot()},
+                    evidence, duration_ms, started_at)
+            if eid is None:
+                raise RuntimeError("Event writer returned no event ID")
+            EVENT_IDS.append(eid)
+            return eid
+        return None
+    except (OSError, ValueError, TypeError, RuntimeError, sqlite3.Error) as error:
+        payload = {
+            "recording_failed": True, "call_id": CALL_ID, "session_id": sid,
+            "stage": "event_write", "error": str(error),
+            "action_may_have_executed": runtime.EXECUTION_STATE != "not_executed",
+            "evidence": evidence,
+            "hint": "Do not replay actions. Preserve evidence and resolve incomplete recording.",
+        }
+        if sid is not None:
+            try:
+                directory = STORAGE_DIR / "recording_errors" / str(sid)
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / f"{CALL_ID}.json").write_text(
+                    json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            except OSError as marker_error:
+                payload["marker_error"] = str(marker_error)
+        print(f"Recording failed: {error}", file=sys.stderr)
+        emit(False, payload)
+        raise SystemExit(1)
 
 
 def backfill_package(package: str | None) -> None:
@@ -228,12 +278,18 @@ def capture(d: "u2.Device", png: Path, xml: Path, meta: Path,
 
     event={"kind","tool","detail","duration_ms"} 时自动写入当前会话事件流。
     """
-    shot = d.screenshot()          # PIL Image
-    shot.save(png)
-    xml_text = d.dump_hierarchy()
-    rotation = _rotation(d, shot)
-    xml.write_text(xml_text, encoding="utf-8")
-    cur = d.app_current() or {}
+    with stage("screenshot"):
+        shot = d.screenshot()
+    with stage("png_save"):
+        shot.save(png)
+    with stage("ui_dump"):
+        xml_text = d.dump_hierarchy()
+    with stage("rotation"):
+        rotation = _rotation(d, shot)
+    with stage("xml_save"):
+        xml.write_text(xml_text, encoding="utf-8")
+    with stage("foreground"):
+        cur = d.app_current() or {}
     info = {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "package": cur.get("package"),
@@ -243,7 +299,10 @@ def capture(d: "u2.Device", png: Path, xml: Path, meta: Path,
     }
     if extra:
         info.update(extra)
-    meta.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+    info["call_id"] = CALL_ID
+    info["timing"] = timing_snapshot()
+    with stage("meta_save"):
+        meta.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
     if event is not None:
         log_auto(event["kind"], event["tool"], event["detail"], info,
                  rel(png), event.get("duration_ms"), event.get("started_at"))
@@ -255,6 +314,7 @@ def capture(d: "u2.Device", png: Path, xml: Path, meta: Path,
 _BOUNDS_RE = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
 
 
+@timed("screen_signature")
 def npm_identity(xml_text: str, fg_package: str | None = None,
                  limit: int = 80) -> list[str]:
     """给一屏算一个**身份签名**：页面上出现过的 `kind=value` 短串集合。
@@ -293,6 +353,7 @@ def npm_identity(xml_text: str, fg_package: str | None = None,
     return out
 
 
+@timed("node_labels")
 def labeled_nodes(xml_text: str, fg_package: str | None = None) -> list[tuple]:
     """取页面上**有文字的节点**位置：[(center, text), ...]。
 
@@ -320,6 +381,7 @@ def labeled_nodes(xml_text: str, fg_package: str | None = None) -> list[tuple]:
     return out
 
 
+@timed("next_targets")
 def next_targets(nodes: list[dict], limit: int = 12,
                  labeled: list[tuple] | None = None) -> list[dict]:
     """从 nodes 里挑出"下一步最可能点的目标"，给一份**精简可点清单**。
@@ -393,6 +455,7 @@ _DECOR_PKGS = ("com.android.systemui", "com.zui.launcher", "com.android.launcher
                "com.android.launcher3")
 
 
+@timed("node_summary")
 def summarize_xml(xml_text: str, max_nodes: int = 300,
                   mode: str = "nav", fg_package: str | None = None) -> list[dict]:
     """把 UI 树压成给 LLM 读的节点列表。
@@ -502,6 +565,10 @@ def add_common_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
                         "不声明默认点同意")
     p.add_argument("--perm", default=None,
                    help="配合 --perm-action：权限类型标记（如 media_images/camera）")
+    p.add_argument("--expect", default=None, dest="expect",
+                   help="检查点（**仅 act 用**）：动作后校验落点。"
+                        "形如 activity=EditTimetableActivity 或 rid=et_schedule_name，"
+                        "逗号=AND、竖线=任一。由工具判", )
     return p
 
 
@@ -536,6 +603,8 @@ def add_common_args_all_subcommands(p: argparse.ArgumentParser) -> None:
                            "choices": ["grant", "deny"],
                            "dest": "perm_action", "help": argparse.SUPPRESS}),
         ("--perm", {"default": argparse.SUPPRESS, "help": argparse.SUPPRESS}),
+        ("--expect", {"default": argparse.SUPPRESS, "dest": "expect",
+                      "help": argparse.SUPPRESS}),
     ]
     subparsers = [a for a in p._actions if isinstance(a, argparse._SubParsersAction)]
     for sp in subparsers:
@@ -551,11 +620,32 @@ def emit(ok: bool, payload: dict) -> None:
         sys.stdout.reconfigure(encoding="utf-8")  # Windows 控制台默认 GBK
     except AttributeError:
         pass
-    print(json.dumps({"ok": ok, **payload}, ensure_ascii=False, indent=2))
+    if ok:
+        runtime.execution("executed")
+    result = {"ok": ok, **payload, "call_id": CALL_ID,
+              "event_ids": list(EVENT_IDS), "execution_state": runtime.EXECUTION_STATE}
+    with stage("serialization"):
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+    timing = {**timing_snapshot(), "response_bytes": len((text + "\n").encode("utf-8"))}
+    timing_file = os.environ.get("ANDROID_TEST_TIMING_FILE")
+    if timing_file:
+        try:
+            path = Path(timing_file)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(timing), encoding="utf-8")
+        except OSError as error:
+            print(text)
+            print(json.dumps({"audit_failed": True, "call_id": CALL_ID,
+                              "stage": "timing_write", "error": str(error)}), file=sys.stderr)
+            raise SystemExit(1)
+    if os.environ.get("ANDROID_TEST_VERBOSE_TIMING") == "1":
+        result["timing"] = timing
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+    print(text)
 
 
-def fail(msg: str) -> None:
-    emit(False, {"error": msg})
+def fail(msg: str, *, rejected: bool = False) -> None:
+    emit(False, {"error": msg, **({"rejected": True} if rejected else {})})
     sys.exit(1)
 
 
@@ -570,17 +660,21 @@ def guard_terminated(tool: str) -> None:
     未开会话（无 current）时不拦，保持工具可独立使用。
     """
     try:
+        runtime.execution("not_executed")
         from db import current_session, get_db
         sid = current_session()
         if not sid:
             return
+        if recording_issues(STORAGE_DIR, sid):
+            fail(f"Session {sid} has incomplete recording. Resolve it and finish ERROR/BLOCKED; do not replay actions.", rejected=True)
         reason = get_db().get_termination(sid)
-    except Exception:  # noqa: BLE001
-        return
+    except (OSError, ValueError, sqlite3.Error) as error:
+        fail(f"Cannot verify session guard: {error}")
     if not reason:
         return
     emit(False, {
         "terminated": True,
+        "rejected": True,
         "session_id": sid,
         "error": f"会话 #{sid} 已终止，拒绝执行 {tool}",
         "reason": reason,

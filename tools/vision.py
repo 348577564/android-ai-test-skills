@@ -16,7 +16,8 @@ import sys
 import urllib.request
 from pathlib import Path
 
-from common import ROOT, emit, fail
+from common import emit, fail
+from runtime import STORAGE_DIR
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")  # Windows 控制台默认 GBK
@@ -31,7 +32,7 @@ def main() -> None:
     p.add_argument("--max-tokens", type=int, default=500)
     args = p.parse_args()
 
-    conf_fp = ROOT / "storage" / "vision.json"
+    conf_fp = STORAGE_DIR / "vision.json"
     try:
         conf = json.loads(conf_fp.read_text(encoding="utf-8"))
     except (OSError, ValueError):

@@ -10,14 +10,16 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from datetime import datetime
 from pathlib import Path
+from runtime import CALL_ID, STORAGE_DIR, recording_issues
 
 ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = ROOT / "storage" / "sessions.db"
-CURRENT_FILE = ROOT / "storage" / "current_session"
+DB_PATH = STORAGE_DIR / "sessions.db"
+CURRENT_FILE = STORAGE_DIR / "current_session"
 
 STATUSES = ("PASS", "FAIL", "WARN", "BLOCKED", "ERROR")
 # 会话中间态：不是结论，不计入通过率统计；必须以 pause 保持或 finish 收尾
@@ -81,6 +83,11 @@ CREATE TABLE IF NOT EXISTS findings(
   note TEXT,
   created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS finding_events(
+  finding_id INTEGER NOT NULL REFERENCES findings(id),
+  event_id INTEGER NOT NULL REFERENCES events(id),
+  PRIMARY KEY(finding_id, event_id)
+);
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, seq);
 CREATE INDEX IF NOT EXISTS idx_findings_session ON findings(session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_kind ON sessions(kind);
@@ -96,7 +103,7 @@ FORMAL_KINDS = ("test",)
 
 
 class SessionDB:
-    """线程安全（thread-local 连接 + WAL）。所有写操作失败静默——记录不该阻断执行。"""
+    """Thread-local connections; trust-critical writes raise on failure."""
 
     def __init__(self, path: Path = DB_PATH):
         self.path = str(path)
@@ -121,11 +128,14 @@ class SessionDB:
                          "ALTER TABLE sessions ADD COLUMN perm_intent_action TEXT",
                          "ALTER TABLE sessions ADD COLUMN perm_intent_perm TEXT",
                          "ALTER TABLE sessions ADD COLUMN perm_intent_at TEXT",
-                         "ALTER TABLE sessions ADD COLUMN knowledge_shown INTEGER DEFAULT 0"):
+                         "ALTER TABLE sessions ADD COLUMN knowledge_shown INTEGER DEFAULT 0",
+                         "ALTER TABLE events ADD COLUMN call_id TEXT"):
                 try:
                     conn.execute(stmt)
                 except sqlite3.OperationalError:
                     pass
+            conn.commit()
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_events_call ON events(call_id)")
             conn.commit()
             self._local.conn = conn
         return self._local.conn
@@ -151,67 +161,109 @@ class SessionDB:
                   data: dict | None = None, evidence: str | None = None,
                   duration_ms: int | None = None,
                   started_at: str | None = None) -> int | None:
-        try:
+        conn = self._conn()
+        with conn:
+            if not conn.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone():
+                raise ValueError(f"Session {session_id} does not exist")
             seq = self._conn().execute(
                 "SELECT COALESCE(MAX(seq),0)+1 FROM events WHERE session_id=?",
                 (session_id,)).fetchone()[0]
             cur = self._conn().execute(
                 "INSERT INTO events (session_id, seq, kind, tool, detail, data_json,"
-                " evidence, duration_ms, started_at, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                " evidence, duration_ms, started_at, created_at, call_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (session_id, seq, kind, tool, detail,
                  json.dumps(data, ensure_ascii=False) if data else None,
-                 evidence, duration_ms, started_at, self._now()))
-            self._conn().commit()
+                 evidence, duration_ms, started_at, self._now(), CALL_ID))
             return cur.lastrowid
-        except sqlite3.Error:
-            return None
 
     def add_finding(self, session_id: int, status: str, expect: str = "",
-                    actual: str = "", note: str = "", event_id: int | None = None) -> int | None:
+                    actual: str = "", note: str = "", event_id: int | None = None,
+                    event_ids: list[int] | None = None) -> int:
         if status not in STATUSES:
-            return None
-        try:
+            raise ValueError(f"Invalid finding status: {status}")
+        ids = list(dict.fromkeys(([event_id] if event_id is not None else []) + (event_ids or [])))
+        if not actual.strip():
+            raise ValueError("Finding actual observation/reason is required")
+        if status in ("PASS", "FAIL", "WARN") and (not ids or not expect.strip()):
+            raise ValueError("Verified findings require an expectation and explicit evidence events")
+        conn = self._conn()
+        with conn:
+            session = conn.execute("SELECT status FROM sessions WHERE id=?", (session_id,)).fetchone()
+            if not session or session["status"] not in INTERIM:
+                raise ValueError("Findings require an existing unfinished session")
+            for eid in ids:
+                self._validate_evidence(conn, session_id, eid)
             cur = self._conn().execute(
                 "INSERT INTO findings (session_id, event_id, status, expect, actual,"
                 " note, created_at) VALUES (?,?,?,?,?,?,?)",
-                (session_id, event_id, status, expect, actual, note, self._now()))
-            self._conn().commit()
-            return cur.lastrowid
-        except sqlite3.Error:
-            return None
+                (session_id, ids[0] if ids else None, status, expect, actual, note, self._now()))
+            fid = cur.lastrowid
+            conn.executemany("INSERT INTO finding_events VALUES (?,?)", [(fid, eid) for eid in ids])
+            return fid
+
+    @staticmethod
+    def _validate_evidence(conn: sqlite3.Connection, session_id: int, event_id: int) -> None:
+        event = conn.execute(
+            "SELECT session_id, evidence FROM events WHERE id=?", (event_id,)).fetchone()
+        if not event or event["session_id"] != session_id or not event["evidence"]:
+            raise ValueError(f"Event {event_id} must contain evidence from session {session_id}")
+        path = Path(event["evidence"])
+        if not path.is_absolute():
+            path = ROOT / path
+        if not path.is_file():
+            raise ValueError(f"Event {event_id} evidence is missing: {path}")
 
     def finish_session(self, session_id: int, status: str, summary: str = "",
                        package: str | None = None) -> bool:
         if status not in STATUSES:
-            return False
+            raise ValueError(f"Invalid session status: {status}")
+        conn = self._conn()
+        conn.execute("BEGIN IMMEDIATE")
         try:
-            cur = self._conn().execute(
+            row = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+            if not row or row["status"] not in INTERIM:
+                raise ValueError("Finish requires an existing unfinished session")
+            findings = conn.execute("SELECT * FROM findings WHERE session_id=?", (session_id,)).fetchall()
+            statuses = {finding["status"] for finding in findings}
+            if row["terminated"] and status != "BLOCKED":
+                raise ValueError("Terminated sessions must finish BLOCKED")
+            if status in ("PASS", "WARN"):
+                allowed = {"PASS"} if status == "PASS" else {"PASS", "WARN"}
+                if not findings or not statuses <= allowed:
+                    raise ValueError("PASS/WARN requires verified, non-blocked findings with no failures")
+            if status == "FAIL" and "FAIL" not in statuses:
+                raise ValueError("FAIL requires a FAIL finding")
+            if status in ("BLOCKED", "ERROR") and not summary.strip():
+                raise ValueError("BLOCKED/ERROR requires a reason in summary")
+            if status not in ("ERROR", "BLOCKED") and recording_issues(Path(self.path).parent, session_id):
+                raise ValueError("Recording/ledger is incomplete; finish ERROR/BLOCKED with a reason")
+            for finding in findings if status in ("PASS", "FAIL", "WARN") else []:
+                if finding["status"] not in ("PASS", "FAIL", "WARN"):
+                    continue
+                ids = [r[0] for r in conn.execute(
+                    "SELECT event_id FROM finding_events WHERE finding_id=?", (finding["id"],))]
+                if finding["event_id"] is not None and finding["event_id"] not in ids:
+                    ids.append(finding["event_id"])
+                if not ids or not finding["expect"].strip() or not finding["actual"].strip():
+                    raise ValueError(f"Finding {finding['id']} is missing evidence or concrete observations")
+                for eid in ids:
+                    self._validate_evidence(conn, session_id, eid)
+            conn.execute(
                 "UPDATE sessions SET status=?, summary=?, finished_at=?,"
                 " package=COALESCE(?, package) WHERE id=?",
                 (status, summary, self._now(), package, session_id))
-            if cur.rowcount == 0:
-                return False  # 会话不存在——不能谎报收尾成功
-            self._conn().commit()
-            # 关联了正式用例 → 回写运行统计（跑过几次/最近结果），
-            # 并把本次会话探到的被测包回填到用例（用例 package 为空时）。
-            # ⚠️ 不回填的话 module_stats 只能按 NULL 聚合成「未识别」，
-            # 仪表盘按模块分类就全废了（真实 bug）。
-            row = self._conn().execute(
-                "SELECT case_id, package FROM sessions WHERE id=?",
-                (session_id,)).fetchone()
-            if row and row[0]:
-                if row[1]:
-                    try:
-                        self._conn().execute(
-                            "UPDATE cases SET package=COALESCE(package, ?) WHERE id=?",
-                            (row[1], row[0]))
-                        self._conn().commit()
-                    except sqlite3.Error:
-                        pass
-                self.touch_case(row[0], session_id, status)
+            if row["case_id"]:
+                updated = conn.execute(
+                    "UPDATE cases SET package=COALESCE(package, ?), last_session_id=?,"
+                    " last_run_at=?, last_status=?, run_count=COALESCE(run_count,0)+1 WHERE id=?",
+                    (package or row["package"], session_id, self._now(), status, row["case_id"]))
+                if updated.rowcount != 1:
+                    raise ValueError("Associated case is missing")
+            conn.commit()
             return True
-        except sqlite3.Error:
-            return False
+        except (sqlite3.Error, ValueError, OSError):
+            conn.rollback()
+            raise
 
     def set_package(self, session_id: int, package: str) -> None:
         """首个 observe 回填被测包名（已有值不覆盖）。"""
@@ -252,15 +304,14 @@ class SessionDB:
 
     def get_termination(self, session_id: int) -> str | None:
         """会话是否已终止；返回终止原因（None=未终止，可继续执行）。"""
-        try:
-            row = self._conn().execute(
-                "SELECT terminated, terminate_reason FROM sessions WHERE id=?",
-                (session_id,)).fetchone()
-            if row and row["terminated"]:
-                return row["terminate_reason"] or "会话已终止"
-            return None
-        except (sqlite3.Error, TypeError, IndexError):
-            return None
+        row = self._conn().execute(
+            "SELECT terminated, terminate_reason FROM sessions WHERE id=?",
+            (session_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"Session {session_id} does not exist")
+        if row["terminated"]:
+            return row["terminate_reason"] or "会话已终止"
+        return None
 
     def clear_termination(self, session_id: int) -> bool:
         """清除终态（resume 时用：人工确认后允许继续）。"""
@@ -497,7 +548,7 @@ class SessionDB:
             ev_paths = [r["evidence"] for r in rows if r["evidence"]]
 
             if remove_evidence:
-                storage_root = (ROOT / "storage").resolve()
+                storage_root = Path(self.path).parent.resolve()
                 step_dirs: set[Path] = set()
                 for rel_p in ev_paths:
                     try:
@@ -521,14 +572,14 @@ class SessionDB:
                         dirs += 1
                 # 自动命名目录 <会话id>/ 整棵删
                 for base in ("evidence", "logs"):
-                    d = ROOT / "storage" / base / str(session_id)
+                    d = Path(self.path).parent / base / str(session_id)
                     if d.is_dir():
                         n = sum(1 for _ in d.rglob("*") if _.is_file())
                         if shutil.rmtree(d, ignore_errors=True) or not d.exists():
                             files += n
                             dirs += 1
                 # 清掉遗留的空目录（只清空的，不动有内容的）
-                ev_root = ROOT / "storage" / "evidence"
+                ev_root = Path(self.path).parent / "evidence"
                 if ev_root.is_dir():
                     for sub in sorted(ev_root.rglob("*"), reverse=True):
                         if sub.is_dir() and not any(sub.iterdir()):
@@ -540,6 +591,9 @@ class SessionDB:
 
             cur = self._conn().execute("DELETE FROM sessions WHERE id=?", (session_id,))
             self._conn().execute("DELETE FROM events WHERE session_id=?", (session_id,))
+            self._conn().execute(
+                "DELETE FROM finding_events WHERE finding_id IN "
+                "(SELECT id FROM findings WHERE session_id=?)", (session_id,))
             self._conn().execute("DELETE FROM findings WHERE session_id=?", (session_id,))
             self._conn().commit()
             return {"ok": cur.rowcount > 0, "files": files, "dirs": dirs}
@@ -678,6 +732,12 @@ class SessionDB:
             "SELECT * FROM events WHERE session_id=? ORDER BY seq", (session_id,))]
         s["findings"] = [dict(r) for r in self._conn().execute(
             "SELECT * FROM findings WHERE session_id=? ORDER BY id", (session_id,))]
+        for finding in s["findings"]:
+            finding["event_ids"] = [r[0] for r in self._conn().execute(
+                "SELECT event_id FROM finding_events WHERE finding_id=? ORDER BY event_id",
+                (finding["id"],))]
+            if finding["event_id"] is not None and finding["event_id"] not in finding["event_ids"]:
+                finding["event_ids"].insert(0, finding["event_id"])
         return s
 
     def session_stats(self) -> dict:
@@ -709,12 +769,21 @@ def set_current(session_id: int) -> None:
     CURRENT_FILE.write_text(str(session_id), encoding="utf-8")
 
 
-def clear_current() -> None:
+def clear_current(expected_id: int | None = None) -> None:
+    if expected_id is not None:
+        try:
+            if int(CURRENT_FILE.read_text(encoding="utf-8").strip()) != expected_id:
+                return
+        except FileNotFoundError:
+            return
     CURRENT_FILE.unlink(missing_ok=True)
 
 
 def current_session() -> int | None:
+    explicit = os.environ.get("ANDROID_TEST_SESSION_ID")
+    if explicit is not None:
+        return int(explicit)
     try:
         return int(CURRENT_FILE.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return None

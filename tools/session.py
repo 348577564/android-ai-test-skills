@@ -3,7 +3,7 @@
 
 用法：
   python session.py start --title "日历新建课程表" --input "用户口述的用例原文..."
-  python session.py finding --status PASS --expect "出现新建成功toast" --actual "OCR读到'创建成功'"
+  python session.py finding --status PASS --event-id <ID> --expect "出现新建成功toast" --actual "OCR读到'创建成功'"
   python session.py finish --status PASS --summary "3/4 PASS，1 BLOCKED(无图库权限)"
   python session.py list
   python session.py current
@@ -16,8 +16,10 @@ import re
 import sys
 from pathlib import Path
 
-from common import knowledge_hint
+from common import emit, knowledge_hint
+import sqlite3
 from db import ROOT, STATUSES, clear_current, current_session, get_db, set_current
+from runtime import STORAGE_DIR
 
 # Windows 控制台默认 GBK，中文/特殊符号会炸 → 全部 CLI 输出强制 UTF-8
 try:
@@ -90,7 +92,7 @@ def apply_pending_paths(only: str | None = None,
     人工节的锚点表带 desc/text 与 ⚠️ 提示，自动边只有 rid/text，混进去反而降质。
     人看过草稿后，可自行把高频边**手抄进对应节点**。
     """
-    draft = ROOT / "storage" / "pending_paths.md"
+    draft = STORAGE_DIR / "pending_paths.md"
     if not draft.is_file():
         return {"ok": False, "error": "没有待确认草稿（先跑 paths 采集）"}
 
@@ -247,7 +249,7 @@ def collect_paths(db, session_id: int) -> str | None:
              or f"{a}** --[{v}]--> **{b}" not in existing_txt]
 
     # 写草稿（不直接改路径图 —— 等人确认）
-    draft = ROOT / "storage" / "pending_paths.md"
+    draft = STORAGE_DIR / "pending_paths.md"
     draft.parent.mkdir(parents=True, exist_ok=True)
     block = [
         f"# 路径图更新建议（会话 #{session_id}）",
@@ -358,6 +360,8 @@ def main() -> None:
     s.add_argument("--expect", default="")
     s.add_argument("--actual", default="")
     s.add_argument("--note", default="")
+    s.add_argument("--event-id", action="append", type=int, default=[],
+                   help="关联本会话证据事件；可重复传入多个事件 ID")
     s.add_argument("--id", type=int, default=None,
                    help="记录到指定会话（暂停/等待中的会话用 --id）")
 
@@ -474,8 +478,7 @@ def main() -> None:
             device_note = "；".join(notes)
         else:
             device_note = "设备未连接（连上后手动跑 logcat.py setup + logcat.py clear）"
-        for stale in (ROOT / "storage").glob(".crash_seen_*"):
-            stale.unlink(missing_ok=True)
+        (STORAGE_DIR / f".crash_seen_{sid}").unlink(missing_ok=True)
         out = {"ok": True, "session_id": sid, "related": related,
                "note": f"后续 observe/act/read 自动记入本会话；{device_note}"}
         # 知识卡浮现：有卡就提示路径 + 小节索引（只提示一次，见 common.knowledge_hint）
@@ -506,8 +509,9 @@ def main() -> None:
         if not sid:
             raise SystemExit("没有进行中的会话，先 session.py start（或用 --id 指定）")
         fid = db.add_finding(sid, args.status, maybe_file(args.expect),
-                             maybe_file(args.actual), maybe_file(args.note))
-        print(json.dumps({"ok": fid is not None, "finding_id": fid}, ensure_ascii=False))
+                             maybe_file(args.actual), maybe_file(args.note),
+                             event_ids=args.event_id)
+        emit(True, {"finding_id": fid, "evidence_event_ids": args.event_id})
     elif args.cmd == "pause":
         sid = current_session()
         if not sid:
@@ -517,7 +521,7 @@ def main() -> None:
         db.log_event(sid, "ask" if args.ask else "pause",
                      f"session {'ask' if args.ask else 'pause'}",
                      maybe_file(args.reason))
-        clear_current()
+        clear_current(sid)
         print(json.dumps({"ok": True, "session_id": sid, "status": status,
                           "note": ("把问题抛给用户，答复后用 resume --id 恢复"
                                    if args.ask else "已暂停；resume 续跑或 finish 收尾")},
@@ -548,23 +552,18 @@ def main() -> None:
         sid = args.id if getattr(args, "id", None) else current_session()
         if not sid:
             raise SystemExit("没有进行中的会话（暂停/等待中的会话用 --id 指定）")
-        ok = db.finish_session(sid, args.status, maybe_file(args.summary), args.package)
-        clear_current()
+        summary = maybe_file(args.summary)
+        ok = db.finish_session(sid, args.status, summary, args.package)
+        cleanup_warning = None
+        try:
+            clear_current(sid)
+        except (ValueError, OSError) as error:
+            cleanup_warning = f"Conclusion committed, but current pointer cleanup failed: {error}"
         crash_n = db.count_crash_events(sid)
         stats = db.finding_stats(sid)
-        fail_n = stats.get("FAIL", 0)
-        summary = maybe_file(args.summary)
         self_check = []
-        if args.status == "PASS" and fail_n:
-            self_check.append(f"⚠️ 存在 {fail_n} 条 FAIL 断言，结论不能是 PASS")
-        if args.status == "FAIL" and not fail_n:
-            self_check.append("⚠️ 结论 FAIL 但没有任何 FAIL 断言——补 finding，"
-                              "或改用 BLOCKED（测不下去）/ ERROR（环境异常）")
-        if args.status == "BLOCKED" and not crash_n and not summary.strip():
-            self_check.append("⚠️ BLOCKED 需要归因（崩溃/前置不满足/找不到控件且人确认）"
-                              "——summary 为空且无崩溃记录")
-        if not stats and args.status in ("PASS", "FAIL"):
-            self_check.append("⚠️ 没有任何断言记录，PASS/FAIL 结论缺乏依据")
+        if cleanup_warning:
+            self_check.append(cleanup_warning)
         # bug1 修复：会话没有关联用例时主动提示入库。
         # 用例不会自动进库（什么时候沉淀是人的决定），但**必须提醒**，
         # 否则跑完的用例悄悄丢掉、仪表盘/用例库永远是旧的。
@@ -573,12 +572,6 @@ def main() -> None:
         if not row.get("case_id") and (row.get("user_input") or "").strip():
             case_hint = (f"本会话尚未进入用例库。沉淀为正式用例："
                          f"python session.py case save --session {sid}")
-        # 崩溃终止过的会话：结论必须是 BLOCKED，否则与工具给出的终止理由矛盾
-        term_reason = db.get_termination(sid)
-        if term_reason and args.status != "BLOCKED":
-            self_check.append(
-                f"⚠️ 本会话因崩溃/ANR 被终止，结论应为 BLOCKED（当前 {args.status}）")
-
         # 采集路径边（不再导出步骤序列）。
         # 为什么换掉：步骤序列是最易腐的知识（换个状态/版本就废），
         # 而「从哪个落脚点、点什么锚点、到了哪」是耐用的结构。
@@ -603,7 +596,7 @@ def main() -> None:
             out["paths_collected"] = path_note
             out["note"] = ("已采集路径边到 knowledge/paths/<包名>.md"
                            "（落脚点 + 锚点 + 去向；下次操作可直接查，不用探索）")
-        print(json.dumps(out, ensure_ascii=False))
+        emit(True, out)
     elif args.cmd == "case":
         run_case_cmd(db, args)
     elif args.cmd == "abandon":
@@ -651,4 +644,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (sqlite3.Error, ValueError, OSError) as error:
+        emit(False, {"error": str(error), "stage": "session",
+                     "rejected": isinstance(error, ValueError),
+                     "hint": "Correct the input or storage issue; rejected finish does not commit."})
+        raise SystemExit(1)

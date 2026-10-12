@@ -578,6 +578,9 @@ async function viewSession(id) {
             ${f.expect ? `<b>期望</b>${esc(f.expect)}` : ""}
             ${f.actual ? `<span class="small">　实际：${esc(f.actual)}</span>` : ""}
             ${f.note ? `<div class="small">${esc(f.note)}</div>` : ""}
+            ${(f.event_ids || []).length ? `<div class="small">证据：
+              ${f.event_ids.map(id => `<a href="#event-${s.id}-${id}">事件 ${esc(id)}</a>`).join(" · ")}
+            </div>` : ""}
           </div>`).join("") || "<span class='muted'>无断言记录</span>"}
       </div>
     </div>
@@ -591,7 +594,7 @@ async function viewSession(id) {
         const act = getAct(e);
         const why = act.why || null;
         return `
-        <div class="event ${esc(e.kind)}">
+        <div class="event ${esc(e.kind)}" id="event-${s.id}-${e.id}">
           <div class="event-head">
             <span class="event-tool">${kindLabel[e.kind] || esc(e.kind)} · ${esc(e.tool || "")}</span>
             ${e.duration_ms != null ? `<span class="metric">执行 ${fmtDuration(e.duration_ms / 1000)}</span>` : ""}

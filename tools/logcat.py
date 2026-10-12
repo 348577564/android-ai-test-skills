@@ -22,6 +22,7 @@ from pathlib import Path
 
 from common import (ROOT, add_common_args_all_subcommands, connect, emit, fail,
                     log_auto, rel)
+from runtime import STORAGE_DIR, timed_call, execution
 
 # 注意：crash buffer 每行有 logcat 标准前缀，标记在行中间，不能用 ^ 锚定
 # ⚠️ native crash（*** FATAL / tombstone）结构不同：无标准前缀与 Process: 行，
@@ -178,7 +179,7 @@ def detect(d, target: str | None, related: list[str],
         sid = current_session() or "loose"
     except Exception:  # noqa: BLE001
         sid = "loose"
-    mark = ROOT / "storage" / f".crash_seen_{sid}"
+    mark = STORAGE_DIR / f".crash_seen_{sid}"
     fps = [hashlib.sha1(
         f"{e.get('process')}|{e.get('pid')}|{e.get('time')}|{e.get('head')}".encode()
     ).hexdigest()[:12] for e in entries]
@@ -218,12 +219,13 @@ def detect(d, target: str | None, related: list[str],
     if (worst.get("time") and anchor and worst["time"] < anchor
             and _RANK.get(worst_scope, 0) > _RANK.get(scoped[-1][0], 0)):
         anchor = worst["time"]
-    ctx = capture_context(d, anchor)
+    ctx = timed_call("crash_evidence", capture_context, d, anchor)
     log_path = None
     if ctx and evidence_dir is not None:
         try:
             evidence_dir.mkdir(parents=True, exist_ok=True)
-            (evidence_dir / "crash.log").write_text(ctx, encoding="utf-8")
+            timed_call("crash_evidence_save", (evidence_dir / "crash.log").write_text,
+                       ctx, encoding="utf-8")
             log_path = rel(evidence_dir / "crash.log")
         except OSError:
             pass
@@ -287,11 +289,16 @@ def main() -> None:
     # --serial 写在子命令前后都能解析（与其他工具一致）
     add_common_args_all_subcommands(p)
     args = p.parse_args()
+    execution("not_executed")
+    if args.cmd != "crash":
+        from common import guard_terminated
+        guard_terminated(f"logcat {args.cmd}")
     try:
         d = connect(args.serial)
     except Exception as e:  # noqa: BLE001
         fail(f"设备连接失败: {e}")
 
+    execution("may_have_executed")
     try:
         if args.cmd == "crash":
             raw = (d.shell(f"logcat -b crash -d -t {args.tail}").output or "")
@@ -299,15 +306,16 @@ def main() -> None:
             if args.package:
                 # 与 classify 同规则：按段精确匹配，不做子串（overlay 同族事故）
                 entries = [e for e in entries if _pkg_match(e["process"], args.package)]
-            ctx = capture_context(d, entries[-1]["time"]) if entries else None
+            ctx = timed_call("crash_evidence", capture_context, d, entries[-1]["time"]) if entries else None
             log_path = None
             if ctx:
-                log_dir = ROOT / "storage" / "logs"
+                log_dir = STORAGE_DIR / "logs"
                 log_dir.mkdir(parents=True, exist_ok=True)
                 fp = log_dir / f"crash_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
                 fp.write_text(ctx, encoding="utf-8")
                 log_path = rel(fp)
             detail = f"崩溃/ANR {len(entries)} 条" + (f"（{args.package}）" if args.package else "")
+            execution("executed")
             log_auto("logcat", "logcat crash", detail,
                      {"count": len(entries), "entries": entries[:10], "log_path": log_path},
                      log_path)
@@ -319,10 +327,12 @@ def main() -> None:
                                 "判定'包名回桌面'类可疑信号必须以此为准，不能只凭画面猜"})
         elif args.cmd == "setup":
             out = (d.shell("logcat -G 5M").output or "").strip()
+            execution("executed")
             emit(True, {"buffer": "5M", "output": out,
                         "hint": "主/系统/crash 缓冲区已扩到 5M，防止长会话日志被冲掉"})
         else:
             d.shell("logcat -b crash -c")
+            execution("executed")
             log_auto("logcat", "logcat clear", "清空 crash 缓冲区", {})
             emit(True, {"cleared": True})
     except Exception as e:  # noqa: BLE001

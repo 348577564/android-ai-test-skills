@@ -6,6 +6,7 @@
   python read.py --name case172/step03 --region ...          # 不传 --image 则现场截一张
 """
 from __future__ import annotations
+from runtime import execution
 
 import argparse
 from pathlib import Path
@@ -14,6 +15,7 @@ from common import (connect, emit, evidence_paths, fail, guard_terminated,
                     log_auto, rel)
 import time
 from datetime import datetime
+from runtime import stage, timed_call
 
 
 def main() -> None:
@@ -26,14 +28,23 @@ def main() -> None:
     p.add_argument("--image", default=None, help="已有截图路径；缺省则现场截图")
     p.add_argument("--region", default=None, help="x1,y1,x2,y2（截图坐标系）")
     args = p.parse_args()
+    execution("not_executed")
 
     # 现场截图会被拦截；读"已有图片"（如崩溃前落盘的证据）放行——
     # 那是复核证据，不是对已终止会话继续操作。
     if not args.image:
         guard_terminated("read")
+        try:
+            d = connect(args.serial)
+        except Exception as e:  # noqa: BLE001
+            fail(f"设备连接失败: {e}")
+
+    t0 = time.perf_counter()
+    started_at = datetime.now().isoformat(timespec="milliseconds")
 
     try:
-        from rapidocr_onnxruntime import RapidOCR
+        with stage("ocr_import"):
+            from rapidocr_onnxruntime import RapidOCR
     except ImportError:
         fail("缺依赖：pip install rapidocr-onnxruntime")
 
@@ -43,24 +54,24 @@ def main() -> None:
             fail(f"截图不存在: {img_path}")
         evidence = rel(img_path)
     else:
-        try:
-            d = connect(args.serial)
-        except Exception as e:  # noqa: BLE001
-            fail(f"设备连接失败: {e}")
+        execution("may_have_executed")
         png, _, meta = evidence_paths(args.dir, args.name)
         png.parent.mkdir(parents=True, exist_ok=True)
-        d.screenshot().save(str(png))
+        image = timed_call("screenshot", d.screenshot)
+        timed_call("png_save", image.save, str(png))
         img_path = png
         evidence = rel(png)
 
-    ocr = RapidOCR()
-    started_at = datetime.now().isoformat(timespec="milliseconds")
-    t0 = time.perf_counter()
-    result, _ = ocr(str(img_path))
-    duration_ms = round((time.perf_counter() - t0) * 1000)
+    ocr = timed_call("ocr_initialize", RapidOCR)
+    execution("may_have_executed")
+    result, _ = timed_call("ocr_inference", ocr, str(img_path))
+    execution("executed")
     lines = []
     from PIL import Image
-    img_w, img_h = Image.open(img_path).size
+    with stage("ocr_image_info"):
+        with Image.open(img_path) as source:
+            img_w, img_h = source.size
+    conversion_started = time.perf_counter()
     for box, text, score in (result or []):
         xs = [pt[0] for pt in box]
         ys = [pt[1] for pt in box]
@@ -78,9 +89,14 @@ def main() -> None:
         lines = [l for l in lines
                  if x1 <= l["center"][0] <= x2 and y1 <= l["center"][1] <= y2]
 
+    from runtime import STAGES
+    STAGES["ocr_result_conversion"] = (time.perf_counter() - conversion_started) * 1000
+    duration_ms = round((time.perf_counter() - t0) * 1000)
     log_auto("read", "read",
              f"OCR {len(lines)} 行" + (f" @ {args.region}" if args.region else ""),
-             {"lines": [l["text"] for l in lines]}, evidence, duration_ms, started_at)
+             {"lines": [l["text"] for l in lines],
+              "duration_scope": "core OCR including initialization/acquisition/conversion; excludes connection, event write and response",
+              "ocr_library_preprocessing_ms": None}, evidence, duration_ms, started_at)
     emit(True, {"image": str(img_path), "lines": lines,
                 "hint": "center 可直接用于 act.py tap；toast 断言请在 act 后尽快 read（浮层会消失）"})
 
