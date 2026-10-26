@@ -129,6 +129,7 @@ class SessionDB:
                          "ALTER TABLE sessions ADD COLUMN perm_intent_perm TEXT",
                          "ALTER TABLE sessions ADD COLUMN perm_intent_at TEXT",
                          "ALTER TABLE sessions ADD COLUMN knowledge_shown INTEGER DEFAULT 0",
+                         "ALTER TABLE sessions ADD COLUMN recording TEXT",
                          "ALTER TABLE events ADD COLUMN call_id TEXT"):
                 try:
                     conn.execute(stmt)
@@ -323,6 +324,34 @@ class SessionDB:
             return True
         except sqlite3.Error:
             return False
+
+    # ── 执行录屏（screenrecord mp4，非"记录完整性"的那个 recording）──────
+    # ⚠️ 命名撞车提醒：本列存的是**屏幕录像文件**的相对路径（storage/evidence/<sid>/rec.mp4），
+    # 与 runtime.recording_issues / recording_errors 那套"调用记账是否完整"完全无关。
+    def set_recording(self, session_id: int, rel_path: str | None) -> bool:
+        """把录屏文件相对路径写回会话（finish 时由 recorder.stop_recording 调用）。"""
+        try:
+            self._conn().execute(
+                "UPDATE sessions SET recording=? WHERE id=?",
+                (rel_path, session_id))
+            self._conn().commit()
+            return True
+        except sqlite3.Error:
+            return False
+
+    def get_recording(self, session_id: int) -> str | None:
+        """取录屏文件相对路径；无录屏返回 None。"""
+        try:
+            row = self._conn().execute(
+                "SELECT recording FROM sessions WHERE id=?", (session_id,)).fetchone()
+        except sqlite3.Error:
+            return None
+        if not row:
+            return None
+        try:
+            return row["recording"]
+        except (IndexError, KeyError):
+            return None
 
     # ── 权限测试意图（声明式，跨命令持久）──────────────────────────
     # 设计参考 AiAgentTest 的 set_permission_intent：AI 在分支开头声明
@@ -578,16 +607,26 @@ class SessionDB:
                         if shutil.rmtree(d, ignore_errors=True) or not d.exists():
                             files += n
                             dirs += 1
-                # 清掉遗留的空目录（只清空的，不动有内容的）
-                ev_root = Path(self.path).parent / "evidence"
-                if ev_root.is_dir():
-                    for sub in sorted(ev_root.rglob("*"), reverse=True):
-                        if sub.is_dir() and not any(sub.iterdir()):
-                            try:
-                                sub.rmdir()
-                                dirs += 1
-                            except OSError:
-                                pass
+                # 清掉本次删除留下的空目录（只清空的，不动有内容的）。
+                # 注意：这里**只沿本次涉及的目录向父级回溯**，不再对整个 evidence
+                # 根目录 rglob——历史实现会对全库（实测 7000+ 目录 / 2 万+ 文件）
+                # 做一次完整递归，单次删除要白等约 10 秒，且随证据累积持续变慢。
+                # 回溯上界：evidence/ 与 logs/ 本身不删（只删其下的空目录）。
+                roots = {(Path(self.path).parent / b).resolve() for b in ("evidence", "logs")}
+                seeds: set[Path] = set(step_dirs)
+                for base in ("evidence", "logs"):
+                    seeds.add(Path(self.path).parent / base / str(session_id))
+                for seed in seeds:
+                    p = seed.parent
+                    while p != storage_root and p.resolve() not in roots and p.is_dir():
+                        try:
+                            if any(p.iterdir()):
+                                break  # 还有内容就停，继续往上只会更空不了
+                            p.rmdir()
+                            dirs += 1
+                        except OSError:
+                            break
+                        p = p.parent
 
             cur = self._conn().execute("DELETE FROM sessions WHERE id=?", (session_id,))
             self._conn().execute("DELETE FROM events WHERE session_id=?", (session_id,))
@@ -664,13 +703,16 @@ class SessionDB:
 
     # ── 读（Web UI 用）───────────────────────────────────────────
     def list_sessions(self, limit: int = 100, kind: str | None = "test",
-                      include: tuple[str, ...] | None = None) -> list[dict]:
+                      include: tuple[str, ...] | None = None,
+                      statuses: list[str] | None = None) -> list[dict]:
         """会话列表。
 
         kind='test'（默认）= 只看正式测试记录；
         include=None 且 kind=None → 全部（含 diag/mock，仅调试用）；
         include=("test","diag") → 正式 + 验证调试（mock 仍排除）。
         mock（占位/构造数据）**永不进正式列表**。
+        statuses: 仅返回结论在列表内的会话（如 ['PASS','FAIL']）；
+                  为空/None 表示不过滤，在 WHERE 子句里追加 IN (...)。
         """
         # ⚠️ 时间基准坑（踩过两次，务必看清）：
         #   · julianday('now') 是 **UTC**，而 started_at/finished_at 由
@@ -695,8 +737,21 @@ class SessionDB:
         elif kind:
             sql += " WHERE COALESCE(s.kind,'test')=?"
             params = (kind,)
+        if statuses:
+            # 仅保留已知的结论值，避免把畸形字符串拼进 IN (?) 后返回 0 行
+            known = {"PASS", "FAIL", "WARN", "BLOCKED", "ERROR",
+                     "running", "paused", "waiting"}
+            keep = [st for st in statuses if st in known]
+            if keep:
+                ph = ",".join("?" for _ in keep)
+                sql += (" AND" if params else " WHERE")
+                sql += f" s.status IN ({ph})"
+                params = params + tuple(keep)
+        # 按结论筛选时（如 PASS），结果可能远超默认 100 行上限，
+        # 必须把上限抬到全部，否则 PASS 等高频结论会被截断而漏行。
+        eff_limit = limit if not statuses else 100000
         sql += " ORDER BY s.id DESC LIMIT ?"
-        rows = self._conn().execute(sql, params + (limit,)).fetchall()
+        rows = self._conn().execute(sql, params + (eff_limit,)).fetchall()
         out = [dict(r) for r in rows]
         # 「回放」入口是否可用：该会话至少有一帧的截图还在磁盘上。
         # ⚠️ 证据可能被 cleanup 轮转或误删 —— 那时按钮要置灰，而不是点进去才发现播不了。

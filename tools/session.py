@@ -478,7 +478,22 @@ def main() -> None:
             device_note = "；".join(notes)
         else:
             device_note = "设备未连接（连上后手动跑 logcat.py setup + logcat.py clear）"
-        (STORAGE_DIR / f".crash_seen_{sid}").unlink(missing_ok=True)
+        # ⚠️ 沙箱 safe-delete 挂起请求会把本轮次内所有 unlink 拦掉（实测 2026-10-21），
+        # 这里用改名代替删除，避免 start 被连带杀死。
+        _seen = STORAGE_DIR / f".crash_seen_{sid}"
+        if _seen.exists():
+            try:
+                _seen.rename(str(_seen) + ".old")
+            except OSError:
+                pass
+        # 执行录屏：后台启动 `adb shell screenrecord`，finish 时停并拉回 mp4，
+        # 路径写回 sessions.recording，WebUI 在「执行时间线」上方用 <video> 播放。
+        # 设备离线 / 无 serial / 不支持 screenrecord → 静默 noop，绝不阻断测试流程。
+        try:
+            from recorder import start_recording
+            start_recording(sid, args.device)
+        except Exception:  # noqa: BLE001
+            pass
         out = {"ok": True, "session_id": sid, "related": related,
                "note": f"后续 observe/act/read 自动记入本会话；{device_note}"}
         # 知识卡浮现：有卡就提示路径 + 小节索引（只提示一次，见 common.knowledge_hint）
@@ -553,6 +568,16 @@ def main() -> None:
         if not sid:
             raise SystemExit("没有进行中的会话（暂停/等待中的会话用 --id 指定）")
         summary = maybe_file(args.summary)
+        # 执行录屏收尾：停掉后台 screenrecord → pull 回 storage/evidence/<sid>/rec.mp4
+        # → 写回 sessions.recording。放在 finish_session **之前**，这样提交时字段已就位。
+        # 失败一律静默（拿不到录屏不该影响结论提交），并清掉 pid 文件避免残留。
+        try:
+            from recorder import stop_recording
+            rec = stop_recording(sid)
+            if rec:
+                db.set_recording(sid, rec)
+        except Exception:  # noqa: BLE001
+            pass
         ok = db.finish_session(sid, args.status, summary, args.package)
         cleanup_warning = None
         try:

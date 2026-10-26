@@ -19,6 +19,36 @@
   --run-soft: #e3f2fa;
   --radius: 12px;
   --shadow: 0 1px 2px rgba(16,24,40,.04), 0 1px 3px rgba(16,24,40,.06);
+  /* 主题切换时给底色/文字加短过渡，避免闪一下；颜色变量本身切换是瞬时的 */
+  color-scheme: light;
+}
+
+/* ── 深色主题 ──
+   由 <html data-theme="dark"> 触发（app.js 里的 theme 模块负责写属性 + localStorage）。
+   ⚠️ 只覆盖变量，不改任何具体组件样式 —— 全站都走 var()，改变量即可整体换肤。
+   ⚠️ 不要把选择器写成 html[data-theme="dark"] body 之类：变量定义在 :root 上，
+      写 html[data-theme="dark"] 就够（与 :root 同元素，优先级更高能覆盖）。 */
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #14161c;
+  --card: #1c1f27;
+  --bg3: #242833;
+  --border: #2f3542;
+  --text: #e6e9f0;
+  --muted: #98a1b6;
+  --accent: #6b93ff;
+  --accent-soft: #1e2a45;
+  --pass: #4ec98a;
+  --pass-soft: #14301f;
+  --fail: #ff7b7b;
+  --fail-soft: #35191b;
+  --warn: #e0b64d;
+  --warn-soft: #33280f;
+  --blocked: #b394ea;
+  --blocked-soft: #251c3a;
+  --run: #62b6e0;
+  --run-soft: #12293a;
+  --shadow: 0 1px 2px rgba(0,0,0,.30), 0 1px 3px rgba(0,0,0,.36);
 }
 * { box-sizing: border-box; margin: 0; }
 body {
@@ -131,13 +161,17 @@ code {
   background: var(--card); border-radius: 0 8px 8px 0; color: var(--muted);
   white-space: pre-wrap; box-shadow: var(--shadow);
 }
-.findings { display: flex; gap: 8px; flex-wrap: wrap; margin: 14px 0; }
+.findings { display: flex; flex-direction: column; gap: 8px; margin: 14px 0; }
+.exp-title { font-size: 12.5px; color: var(--muted); letter-spacing: .5px; margin: 2px 0 4px; }
 .finding {
   background: var(--card); border: 1px solid var(--border); border-radius: 8px;
-  padding: 8px 12px; font-size: 13px; max-width: 480px; box-shadow: var(--shadow);
+  padding: 10px 14px; font-size: 13px; box-shadow: var(--shadow);
+  border-left: 3px solid var(--accent);
 }
 .finding b { margin-right: 6px; }
-.finding .small { color: var(--muted); font-size: 12px; }
+.finding .exp-idx { font-weight: 600; color: var(--accent); margin: 0 6px 0 4px; }
+.finding .small { color: var(--muted); font-size: 12px; display: block; margin-top: 4px; }
+.rec-dur { color: var(--muted); font-size: 13px; font-weight: 400; }
 
 .final-result {
   display: flex; align-items: center; gap: 12px;
@@ -203,11 +237,22 @@ code {
    （给舞台加 max-height 会让 object-fit 留白 → 圆点偏移，已踩过）。
    所以改为按视口反推宽度：取"92vw"与"按高度算出的可用宽"中的较小值。
 
-   高度账（实测）：图之外还有 头 ~58 + 字幕 ~50 + 播控 ~44 + 内边距 ~32 ≈ 184px。
-   要总高 ≤ 88vh → 图高 ≤ 88vh - 184px → 宽 ≤ (88vh - 184px) × 3040/1904。
+    高度账（实测）：图之外还有 头 ~58 + 字幕 ~50 + 播控 ~44 + 内边距 ~32 + 两段间距 ~20 ≈ 204px。
+    要总高 ≤ 84vh（与 .modal 的 max-height 对齐，原 88vh 会高估预算、把播控条挤出可视区）→ 图高 ≤ 84vh - 204px → 宽 ≤ (84vh - 204px) × 3040 / 1904。
    min() 里可以直接写这个算式（CSS 支持在 calc 里混用 vh 与 px）。 */
 .modal.rp-modal {
-  width: min(1100px, 92vw, calc((88vh - 184px) * 3040 / 1904));
+  width: min(1100px, 92vw, calc((84vh - 204px) * 3040 / 1904));
+  /* 可拖动：transform 由 JS 的 makeDraggable 写入（不改 left/top，
+     以免破坏上面的宽度算式与 flex 居中）。 */
+  will-change: transform;
+}
+/* 拖动中：抬升层级 + 强化阴影，并**关掉过渡**，否则跟手感会发飘。
+   标题栏只在拖动时显示抓手光标，避免普通弹窗也像可拖。 */
+.modal.rp-modal .modal-head { cursor: move; }
+.modal.rp-modal.dragging {
+  box-shadow: 0 18px 56px rgba(16,24,40,.34);
+  transition: none;
+  z-index: 1;
 }
 
 /* ── 轨迹回放（截图串播 + 点击位置遮罩）── */
@@ -259,7 +304,7 @@ code {
 .rp-count { font-size: 12.5px; color: var(--muted); min-width: 68px; text-align: right; }
 .rp-speed { font-size: 12.5px; padding: 3px 6px; border-radius: 6px;
   border: 1px solid var(--border); background: var(--card); color: inherit; }
-.rp-warn { font-size: 12.5px; color: #b8860b; }
+.rp-warn { font-size: 12.5px; color: var(--warn); }
 button[disabled] { opacity: .45; cursor: not-allowed; }
 .ev-file a { color: var(--accent); text-decoration: none; }
 .ev-file a:hover { text-decoration: underline; }
@@ -330,19 +375,43 @@ button:disabled { opacity: .5; cursor: default; }
   text-overflow: ellipsis; white-space: nowrap;
 }
 .lt-row .c-start { font-variant-numeric: tabular-nums; }
-.lt-row .c-act { display: flex; gap: 6px; justify-content: flex-end; }
+.lt-row .c-act { display: flex; gap: 8px; justify-content: flex-end; }
 .lt-empty { padding: 22px 16px; color: var(--muted); font-size: 13px; }
 .row-link { color: var(--text); text-decoration: none; cursor: pointer; }
 .row-link:hover { color: var(--accent); text-decoration: underline; }
 
-/* 测试记录表列宽：c-act 必须够宽，否则「删除」被裁（真实 bug） */
+/* 测试记录表列宽与对齐。
+   ⚠️ c-act 必须够宽，否则「删除」被裁（真实 bug）。
+   风格：**所有列（表头 + 数据）统一居中**（用户选定）。
+   列宽按内容实测确定（p90 文字宽）：标题 219 / 结论 47 / 模块 65 /
+   开始时间 113 / 耗时 45 / 事件 32 / 操作 121。
+   ⚠️ 标题列必须设**上限**，不能给 1fr：实测 1fr 会让它独吞全部剩余空间
+      涨到 469px，使相邻文字间隙达 490px，比调整前更糟。
+      限 250px 的取舍：108 个会话标题里约 6 个（6%）会被省略号截断，
+      最长标题 273px。标题可点开看全，故按"整齐优先"取 250px。
+   ⚠️ 代价：标题是长文本（p50=150px、max=273px），居中后各行文字起点会随
+      长度左右浮动，左边缘不如左对齐齐整。这是"全部居中"风格的固有取舍。 */
 .list-table.recs .lt-head, .list-table.recs .lt-row {
-  grid-template-columns: 52px minmax(160px, 2.2fr) 96px minmax(110px, 1.1fr)
-                         158px 72px 92px 96px;
+  grid-template-columns: 36px 44px minmax(140px, 230px) 68px 88px
+                         120px 68px 88px 120px;
 }
+/* 勾选框列：垂直居中（checkbox 是行内替换元素，text-align 管不了纵向） */
+.list-table.recs .c-chk { display: flex; align-items: center; justify-content: center; }
+.list-table.recs .c-chk input { cursor: pointer; }
+/* 「删除选中」与表格「操作」列对齐：工具栏复用表格的 9 列网格，
+   筛选组横跨前 8 列，按钮固定落在第 9 列（操作列）内居中 */
+.rec-toolbar2 .rec-filters { grid-column: 1 / 9; display: flex; align-items: center; gap: 10px; min-width: 0; }
+.rec-toolbar2 .rec-batch-del { grid-column: 9; justify-self: center; }
+/* 所有列统一居中（表头 + 数据） —— 一条规则覆盖全部单元格，
+   避免逐个列写 text-align 造成"部分居中、部分左对齐"的不统一观感。 */
+.list-table.recs .lt-head > span,
+.list-table.recs .lt-row > span { text-align: center; }
+/* 例外：操作列是按钮组，用 flex 居中（text-align 对 flex 容器不生效） */
+.list-table.recs .lt-row .c-act { justify-content: center; }
+.list-table.recs .lt-head .c-act { text-align: center; }
 .lt-row .c-act { overflow: visible; }
 .lt-row .c-act button { white-space: nowrap; }
-.lt-row.diag { background: #fbfbfd; }
+.lt-row.diag { background: var(--bg3); }
 .lt-row.diag .c-title { font-weight: 500; }
 .tag-diag {
   display: inline-block; font-size: 10.5px; font-weight: 600; line-height: 1.6;
@@ -369,13 +438,58 @@ button:disabled { opacity: .5; cursor: default; }
 /* 小按钮 */
 button.sm { padding: 4px 12px; font-size: 12px; border-radius: 6px; }
 button.danger { background: var(--fail); }
-button.ghost.danger { background: var(--card); color: var(--fail); border-color: #f0c9c9; }
+button.ghost.danger { background: var(--card); color: var(--fail); border-color: var(--fail-soft); }
 button.ghost.danger:hover { background: var(--fail-soft); }
 
 /* ══════════════ 模块分组 tab ══════════════ */
 .tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
 .lib-toolbar { display: flex; align-items: flex-start; gap: 14px; margin-bottom: 14px; }
 .lib-toolbar .tabs { margin-bottom: 0; flex: 1; }
+/* 测试记录：搜索框与统计行同处一行（搜索框在左，统计紧邻其右） */
+.rec-toolbar { align-items: center; gap: 12px; flex-wrap: wrap; }
+/* 搜索框：占满"统计文字"之外的空间（自适应拉宽），避免与右侧统计之间
+   留下大片空白导致视觉割裂；上限 560px，窄屏时允许换行。 */
+.rec-search {
+  flex: 1 1 320px; min-width: 200px; max-width: 560px;
+  padding: 9px 18px; font-size: 13.5px; font-family: inherit;
+  border-radius: 999px; border: 1px solid var(--border);
+  background: var(--card); color: var(--text); outline: none;
+  text-align: left; transition: border-color .15s, box-shadow .15s;
+}
+/* 统计文字：紧跟在搜索框右侧，不再推到最右端 */
+.rec-stats { margin: 0; text-align: left; white-space: nowrap; }
+/* 主题切换按钮：与「正式测试」同行，靠行尾 */
+.theme-toggle {
+  flex: 0 0 auto; margin-left: auto; white-space: nowrap;
+  transition: background .15s, color .15s, border-color .15s;
+}
+.rec-search:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(90,140,255,.14); }
+.rec-search::placeholder { color: var(--muted); }
+/* 结论筛选第二行：与表格同款 9 列网格（列宽和 gap 必须一致，否则列位错开） */
+.rec-toolbar2 {
+  display: grid;
+  grid-template-columns: 36px 44px minmax(140px, 230px) 68px 88px
+                         120px 68px 88px 120px;
+  gap: 12px; align-items: center; margin: -4px 0 14px;
+}
+.rec-flt-label { margin: 0; white-space: nowrap; }
+/* 状态筛选按钮：复用 chip 配色，默认描边态；选中后填充同色（与 .tab.on 一致） */
+.stab {
+  display: inline-flex; align-items: center; cursor: pointer; font-size: 12.5px;
+  padding: 5px 13px; border-radius: 999px; background: var(--card);
+  border: 1px solid var(--border); color: var(--muted); user-select: none;
+  transition: border-color .15s, color .15s, background .15s; line-height: 1.2;
+}
+.stab:hover { border-color: var(--accent); color: var(--accent); }
+.stab.on { color: #fff; font-weight: 600; border-color: transparent; }
+/* 各状态选中态的底色（与 .chip 软色系对应的实色，保证深色模式可读） */
+.stab.on[data-st="PASS"]    { background: var(--pass); }
+.stab.on[data-st="FAIL"]    { background: var(--fail); }
+.stab.on[data-st="BLOCKED"] { background: var(--blocked); }
+.stab.on[data-st="WARN"]    { background: var(--warn); }
+.stab.on[data-st="ERROR"]   { background: var(--fail); }
+/* 隐藏浏览器原生 search 的清除按钮（清空改为直接删字符，删空即恢复全部列表） */
+.rec-search::-webkit-search-cancel-button { -webkit-appearance: none; appearance: none; }
 .tab {
   padding: 5px 14px; border-radius: 999px; cursor: pointer; font-size: 12.5px;
   background: var(--card); border: 1px solid var(--border); color: var(--muted);
@@ -455,7 +569,7 @@ button.ghost.danger:hover { background: var(--fail-soft); }
 /* 整体成功率 4 段配色（与模块进度条同一套色板，保持一致）：
    ≥90 优秀 / ≥70 良好 / ≥50 偏低 / <50 差 */
 .big-rate.lv-a b { color: var(--pass); }
-.big-rate.lv-b b { color: #0d8f7a; }
+.big-rate.lv-b b { color: var(--pass); }
 .big-rate.lv-c b { color: var(--warn); }
 .big-rate.lv-d b { color: var(--fail); }
 .chart-mid { width: 100%; height: 380px; flex: 1; min-height: 0; }
@@ -513,7 +627,17 @@ button.ghost.danger:hover { background: var(--fail-soft); }
   font-size: 13px; line-height: 1.7; border: 1px solid var(--border);
 }
 .test-box.pending { background: var(--bg3); color: var(--muted); }
-.test-box.ok { background: var(--pass-soft); border-color: #bfe6cf; color: var(--pass); }
-.test-box.err { background: var(--fail-soft); border-color: #f2c9c9; color: var(--fail); }
+.test-box.ok { background: var(--pass-soft); border-color: var(--pass); color: var(--pass); }
+.test-box.err { background: var(--fail-soft); border-color: var(--fail); color: var(--fail); }
 .test-box code { background: rgba(0,0,0,.06); }
 .test-box .meta { color: var(--muted); font-size: 12.5px; }
+
+/* 执行录屏播放器（内嵌在时间线上方） */
+.rec-wrap {
+  margin: 0 0 8px; padding: 10px; background: var(--card);
+  border: 1px solid var(--border); border-radius: var(--radius);
+}
+.rec-video {
+  display: block; width: 100%; max-width: 480px; max-height: 70vh;
+  margin: 0 auto; background: #000; border-radius: 8px;
+}

@@ -58,11 +58,14 @@ def _mask(s: str) -> str:
     return s[:4] + "*" * (len(s) - 8) + s[-4:]
 
 
-# 1x1 透明 PNG：视觉连通性测试用最小图，不依赖本地证据文件
-_TINY_PNG = (
-    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00"
-    b"\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+# 64x64 纯灰 PNG：视觉连通性测试用探测图。
+# 不能用 1x1 —— 部分多模态模型（如 qwen3-vl / qwen3.x 系列）强制校验图片尺寸
+# （要求 height、width 均 > 10），1x1 会被服务端以 400 invalid_parameter_error 拒绝，
+# 看起来像 base_url/api_key 配错，实际只是探测图太小。
+_PROBE_PNG = (
+    b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x40\x00\x00\x00\x40\x08\x02\x00\x00\x00\x25\x0b\xe6\x89\x00\x00\x00\x4b\x49\x44\x41\x54\x78\xda\xed\xcf\x31\x0d\x00\x00\x0c\x03\xa0\x4a\xaf\xf4\x4a\xd8\xbd\x04\x1c"
+    b"\x90\x3e\x17\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x81\xcb\x00\x1f\x3e\x01\x69\xe6\x7d\x4c\x9c"
+    b"\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82"
 )
 
 
@@ -80,7 +83,7 @@ def _test_vision() -> dict:
     if not (base and model and key):
         return {"ok": False, "error": "配置不完整（base_url / model / api_key 均必填）"}
 
-    b64 = base64.b64encode(_TINY_PNG).decode()
+    b64 = base64.b64encode(_PROBE_PNG).decode()
     body = json.dumps({
         "model": model,
         "messages": [{"role": "user", "content": [
@@ -110,15 +113,22 @@ def _test_vision() -> dict:
             detail = e.read().decode("utf-8", "replace")[:300]
         except Exception:  # noqa: BLE001
             pass
+        hint = "401/403 多为 api_key 错误；404 多为 base_url 少了或多了 /v1"
+        low = (detail or "").lower()
+        if e.code == 400 and "image" in low and (
+                "length" in low or "width" in low or "size" in low):
+            hint = ("模型拒绝的是『测试探测图』的尺寸，不是你的配置。"
+                    "鉴权与模型均已通过；请重启测试台使 64x64 探测图生效")
         return {"ok": False, "error": f"HTTP {e.code} {e.reason}", "detail": detail,
-                "hint": "401/403 多为 api_key 错误；404 多为 base_url 少了或多了 /v1"}
+                "hint": hint}
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"{type(e).__name__}: {e}",
                 "hint": "网络不可达或 base_url 写错（需含 http(s):// 与 /v1 前缀，视服务而定）"}
 
 MIME = {".html": "text/html", ".js": "application/javascript",
         ".css": "text/css", ".png": "image/png", ".xml": "text/xml",
-        ".json": "application/json", ".md": "text/markdown", ".log": "text/plain"}
+        ".json": "application/json", ".md": "text/markdown", ".log": "text/plain",
+        ".mp4": "video/mp4", ".webm": "video/webm"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -132,6 +142,44 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, obj, code: int = 200):
         self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
                    "application/json")
+
+    def _send_file(self, fp: Path, ctype: str):
+        """伺服磁盘文件，支持 HTTP Range（让 <video> 能拖动快进）。
+
+        - 二进制媒体（video/audio）**不带 charset**（带了浏览器会拒播）；
+        - 客户端带 `Range: bytes=START-END` 时回 `206 Partial Content` +
+          `Content-Range`，否则回 `200` 全量，并始终带 `Accept-Ranges: bytes`。
+        """
+        data = fp.read_bytes()
+        size = len(data)
+        # 媒体类型不该带 charset
+        if ctype.startswith("video/") or ctype.startswith("audio/"):
+            ctype = ctype.split(";")[0]
+        rng = self.headers.get("Range")
+        start, end = 0, size - 1
+        if rng and rng.startswith("bytes="):
+            try:
+                part = rng[len("bytes="):].split(",")[0].strip()
+                if "-" in part:
+                    a, b = part.split("-", 1)
+                    start = int(a) if a else 0
+                    end = int(b) if b else size - 1
+                    start = max(0, min(start, size - 1))
+                    end = max(start, min(end, size - 1))
+            except ValueError:
+                start, end = 0, size - 1
+        chunk = data[start:end + 1]
+        if rng and start <= end < size:
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.send_header("Content-Length", str(len(chunk)))
+        else:
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(chunk)))
+        self.send_header("Content-Type", ctype)
+        self.send_header("Accept-Ranges", "bytes")
+        self.end_headers()
+        self.wfile.write(chunk)
 
     def _static(self, relpath: str):
         fp = (WEBUI_DIR / relpath).resolve()
@@ -173,6 +221,7 @@ class Handler(BaseHTTPRequestHandler):
                 "seq": e.get("seq"),
                 "kind": e.get("kind"),
                 "evidence": ev,
+                "ts": e.get("created_at"),
                 "x": act.get("x"),
                 "y": act.get("y"),
                 "size": size if len(size) == 2 else None,
@@ -212,8 +261,7 @@ class Handler(BaseHTTPRequestHandler):
             fp = fp.resolve()
             # is_relative_to 而非 startswith：字符串前缀会放过同前缀兄弟目录
             if fp.is_relative_to(STORAGE_DIR) and fp.is_file():
-                return self._send(200, fp.read_bytes(),
-                                  MIME.get(fp.suffix, "application/octet-stream"))
+                return self._send_file(fp, MIME.get(fp.suffix, "application/octet-stream"))
         return self._json({"error": "not found"}, 404)
 
     # ── GET ─────────────────────────────────────────────────────
@@ -232,10 +280,12 @@ class Handler(BaseHTTPRequestHandler):
             # 口径一致，否则"显示全部"会漏出 mock 而计数里又没有它。
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             show_all = qs.get("all", ["0"])[0] in ("1", "true")
+            statuses = [s for s in qs.get("status", []) if s] or None
             db = get_db()
             sessions = db.list_sessions(
                 include=("test", "diag") if show_all else None,
-                kind=None if show_all else "test")
+                kind=None if show_all else "test",
+                statuses=statuses)
             return self._json({"sessions": sessions,
                                "stats": db.session_stats(),
                                "kinds": db.session_kind_counts()})

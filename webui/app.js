@@ -7,6 +7,9 @@ const main = $("#main");
 let kbCurrent = null;    // 当前编辑的知识卡名
 let caseFilter = "all";  // 用例库当前模块过滤
 let showDiag = false;    // 测试记录是否显示验证/调试会话
+let recQuery = "";       // 测试记录搜索词（标题 / 结论 模糊匹配，当前会话内保留）
+let recSearchTimer = null; // 输入防抖：停止输入 1s 后自动搜索
+let recStatusFilter = []; // 测试记录结论筛选（多选）：PASS/FAIL/BLOCKED/WARN/ERROR；空=不过滤
 
 // ── 工具 ──
 async function api(path, opts) {
@@ -17,6 +20,45 @@ async function api(path, opts) {
 const esc = s => String(s ?? "").replace(/[&<>"]/g,
   c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const statusChip = s => s ? `<span class="chip ${esc(s)}">${esc(s)}</span>` : "";
+
+// ── 主题（浅色 / 深色）──
+// 切换方式：在 <html> 上写 data-theme="dark"，CSS 里 html[data-theme="dark"] 覆盖变量。
+// 持久化到 localStorage；首次进入若无记录则跟随系统 prefers-color-scheme。
+const THEME_KEY = "dsh-theme";
+function systemPrefersDark() {
+  try { return window.matchMedia("(prefers-color-scheme: dark)").matches; } catch { return false; }
+}
+function getTheme() {
+  let saved = null;
+  try { saved = localStorage.getItem(THEME_KEY); } catch {}
+  return saved === "dark" || saved === "light" ? saved : (systemPrefersDark() ? "dark" : "light");
+}
+function applyTheme(mode) {
+  const root = document.documentElement;
+  if (mode === "dark") root.setAttribute("data-theme", "dark");
+  else root.removeAttribute("data-theme");
+  syncThemeButtons(mode);
+}
+// 把按钮外观同步为当前主题（每次视图重渲染后都要调，因为按钮是重新生成的）
+function syncThemeButtons(mode) {
+  const dark = (mode || getTheme()) === "dark";
+  $$("[data-theme-toggle]").forEach(b => {
+    b.textContent = dark ? "☀ 浅色" : "🌙 深色";
+    b.title = dark ? "切换到浅色主题" : "切换到深色主题";
+    b.setAttribute("aria-label", b.title);
+    b.setAttribute("aria-pressed", String(dark));
+  });
+}
+function setTheme(mode) {
+  try { localStorage.setItem(THEME_KEY, mode); } catch {}
+  applyTheme(mode);
+}
+function toggleTheme() {
+  setTheme(getTheme() === "dark" ? "light" : "dark");
+}
+// 尽早应用，避免首屏闪白（脚本在 body 末尾也会再调一次幂等应用）
+applyTheme(getTheme());
+
 
 /* 标准时间展示：ISO(含毫秒/无时区) → YYYY-MM-DD HH:MM:SS
    后端存的是本地时间 isoformat（如 2026-09-21T18:57:09.517），
@@ -100,6 +142,80 @@ function modal(title, bodyHTML, footerHTML = "") {
   return { el, close };
 }
 
+// ── 拖动模态框（用于轨迹回放：图较大，常要挪开遮挡）──
+// 用 transform: translate() 位移，而不是改 left/top：
+//   · 模态框仍由 .modal-mask 的 flex 居中，不必关心初始位置；
+//   · 不参与布局，不会把宽版回放窗口的宽度算式（92vw / 按高度反推）撑坏；
+//   · 复位只要把 translate 清零。
+// 边界：位移量限制在"不把标题栏拖出视口"的范围内，拖飞了也能拖回来。
+function makeDraggable(panel, handle) {
+  const h = handle || panel.querySelector(".modal-head");
+  if (!h) return;
+  let dx = 0, dy = 0, sx = 0, sy = 0, dragging = false;
+  // ⚠️ 必须在**面板未被位移时**量一次基准位置并缓存：
+  //    getBoundingClientRect() 是含 transform 的，若在 pointermove 里边移边量，
+  //    每次量到的 rect 都已经含了新的 dx，反推 base 就会错，
+  //    结果 clamp 形同虚设（实测能把窗口拖到 left=100334 飞出视口）。
+  let base = null;
+  const measure = () => {
+    const t = panel.style.transform;
+    panel.style.transform = "none";                 // 临时归零，量真实基准
+    const r = panel.getBoundingClientRect();
+    base = { l: r.left, t: r.top, w: r.width, h: r.height };
+    panel.style.transform = t;
+  };
+
+  const clamp = () => {
+    if (!base) measure();
+    // 至少留 120px 在视口内，避免拖到抓不回来
+    const keep = Math.min(120, base.w);
+    const minX = -base.l - (base.w - keep);
+    const maxX = window.innerWidth - keep - base.l;
+    const minY = -base.t;
+    const maxY = window.innerHeight - 48 - base.t;
+    dx = Math.max(minX, Math.min(maxX, dx));
+    dy = Math.max(minY, Math.min(maxY, dy));
+  };
+  const apply = () => { panel.style.transform = `translate(${dx}px, ${dy}px)`; };
+
+  h.style.cursor = "move";
+  h.style.touchAction = "none";
+  h.style.userSelect = "none";
+  h.title = "按住可拖动窗口（双击标题栏 / 点 ⌖ 复位）";
+
+  h.addEventListener("pointerdown", ev => {
+    if (ev.target.closest("button")) return;   // 别抢关闭按钮的点击
+    dragging = true;
+    base = null;                                // 每次起拖前重新量基准（窗口尺寸可能变过）
+    sx = ev.clientX - dx; sy = ev.clientY - dy;
+    h.setPointerCapture(ev.pointerId);
+    panel.classList.add("dragging");
+  });
+  h.addEventListener("pointermove", ev => {
+    if (!dragging) return;
+    dx = ev.clientX - sx; dy = ev.clientY - sy;
+    clamp(); apply();
+  });
+  const end = ev => {
+    if (!dragging) return;
+    dragging = false;
+    panel.classList.remove("dragging");
+    try { h.releasePointerCapture(ev.pointerId); } catch {}
+  };
+  h.addEventListener("pointerup", end);
+  h.addEventListener("pointercancel", end);
+
+  // 双击标题栏复位
+  const reset = () => { dx = 0; dy = 0; base = null; apply(); };
+  h.addEventListener("dblclick", reset);
+  // 视口变化时重新钳制，避免缩小窗口后弹窗留在视口外
+  window.addEventListener("resize", () => {
+    if (dx || dy) { base = null; clamp(); apply(); }
+  });
+
+  return { reset };
+}
+
 // ── 视图路由（点哪个哪个高亮）──
 const VIEWS = {
   dashboard: () => viewDashboard(),
@@ -114,6 +230,10 @@ function activateNav(view) {
 $$(".nav-item").forEach(el =>
   el.addEventListener("click", () => {
     activateNav(el.dataset.view);
+    // 切走时取消待触发的搜索防抖，避免 1s 后把列表视图盖回来
+    if (el.dataset.view !== "sessions" && recSearchTimer) {
+      clearTimeout(recSearchTimer); recSearchTimer = null;
+    }
     (VIEWS[el.dataset.view] || viewDashboard)();
   }));
 
@@ -315,22 +435,76 @@ async function viewDashboard() {
 }
 
 // ══════════════════ 测试记录 ══════════════════
+// （recQuery / recSearchTimer 已在文件头部声明）
+
+// 结论的本地化别名：输入中文也能命中对应状态（不区分大小写）
+const STATUS_FILTERS = ["PASS", "FAIL", "BLOCKED", "WARN", "ERROR"];
+const STATUS_ALIASES = {
+  PASS: ["pass", "通过", "成功", "合格", "已通过"],
+  FAIL: ["fail", "失败", "不通过", "未通过", "错误"],
+  BLOCKED: ["blocked", "阻断", "阻塞", "受阻", "无法判定"],
+  WARN: ["warn", "警告", "告警"],
+  RUNNING: ["running", "执行中", "运行中", "进行中"],
+};
+
+// 一条记录是否命中搜索词：标题 或 结论（含中文别名），均不区分大小写
+function matchSession(s, q) {
+  const title = String(s.title || `会话 #${s.id}`).toLowerCase();
+  if (title.includes(q)) return true;
+  const st = String(s.status || "").toUpperCase();
+  if (st.toLowerCase().includes(q)) return true;
+  const alias = STATUS_ALIASES[st];
+  return !!(alias && alias.some(a => a.includes(q)));
+}
+
 async function viewSessions() {
   activateNav("sessions");
   main.innerHTML = "<div class='sub'>加载中…</div>";
-  const { sessions, kinds } = await api("/api/sessions" + (showDiag ? "?all=1" : ""));
+  let url = "/api/sessions" + (showDiag ? "?all=1" : "");
+  if (recStatusFilter.length) {
+    const p = recStatusFilter.map(s => "status=" + encodeURIComponent(s)).join("&");
+    url += (url.includes("?") ? "&" : "?") + p;
+  }
+  const { sessions, kinds } = await api(url);
   const diagN = (kinds && kinds.diag) || 0;
   const testN = (kinds && kinds.test) || 0;
 
+  // 标题 / 结论 模糊匹配（不区分大小写）
+  const q = recQuery.trim().toLowerCase();
+  let matched = q ? sessions.filter(s => matchSession(s, q)) : sessions;
+  // 结论多选筛选（后端已按 URL 过滤；这里再兜底一次，避免前端缓存态不一致）
+  if (recStatusFilter.length) {
+    const allow = recStatusFilter.map(s => s.toUpperCase());
+    matched = matched.filter(s => allow.includes(String(s.status || "").toUpperCase()));
+  }
+
+  const fcount = recStatusFilter.length
+    ? ` · 结论筛选 [${recStatusFilter.join("/")}] 命中 <b>${matched.length}</b> 条` : "";
+
   main.innerHTML = `
     <h1>测试记录</h1>
-    <div class="lib-toolbar">
-      <div class="sub" style="margin:0">正式测试 <b>${testN}</b> 条${diagN ? ` · 验证/调试 <b>${diagN}</b> 条（默认不显示）` : ""}</div>
-      <span style="flex:1"></span>
+    <div class="lib-toolbar rec-toolbar">
+      <input type="search" id="rec-search" class="rec-search" placeholder="按标题或结论搜索…"
+        value="${esc(recQuery)}" title="按标题或结论模糊匹配（不区分大小写），停止输入 1 秒自动搜索">
+      <div class="sub rec-stats">正式测试 <b>${testN}</b> 条${diagN ? ` · 验证/调试 <b>${diagN}</b> 条（默认不显示）` : ""}${
+        q ? ` · 搜索“${esc(recQuery.trim())}”命中 <b>${matched.length}</b> 条` : ""}${fcount}</div>
       ${diagN ? `<label class="chk"><input type="checkbox" id="show-diag"${showDiag ? " checked" : ""}>显示验证记录</label>` : ""}
+      <button class="ghost sm theme-toggle" data-theme-toggle
+        title="切换浅色/深色主题">🌙 深色</button>
+    </div>
+    <div class="lib-toolbar rec-toolbar2">
+      <div class="rec-filters">
+        <span class="sub rec-flt-label">按结论筛选：</span>
+        ${STATUS_FILTERS.map(st => `<button class="stab${recStatusFilter.includes(st) ? " on" : ""}"
+          data-st="${st}" title="筛选结论为 ${st} 的记录（可多选）">${statusChip(st)}</button>`).join("")}
+        ${recStatusFilter.length ? `<button class="ghost sm" id="rec-flt-clear" title="清除结论筛选">清除筛选</button>` : ""}
+      </div>
+      <button class="ghost sm danger rec-batch-del" id="rec-batch-del" disabled
+        title="删除勾选的记录及其截图/日志证据，不可恢复">🗑 删除选中</button>
     </div>
     <div class="list-table recs">
       <div class="lt-head">
+        <span class="c-chk"><input type="checkbox" id="rec-sel-all" title="全选 / 全不选（仅当前列表）"></span>
         <span class="c-id">#</span>
         <span class="c-title">标题</span>
         <span class="c-status">结论</span>
@@ -340,8 +514,10 @@ async function viewSessions() {
         <span class="c-cnt">事件/断言</span>
         <span class="c-act">操作</span>
       </div>
-      ${sessions.map(s => `
+      ${matched.map(s => `
         <div class="lt-row${s.kind === "diag" ? " diag" : ""}" data-id="${s.id}">
+          <span class="c-chk"><input type="checkbox" class="rec-check" data-id="${s.id}"
+            title="勾选后可批量删除"></span>
           <span class="c-id">${s.id}</span>
           <span class="c-title">
             ${s.kind === "diag" ? '<span class="tag-diag">验证</span>' : ""}
@@ -358,11 +534,53 @@ async function viewSessions() {
               title="${s.has_evidence ? "回放本次执行的轨迹（截图串播）" : "该记录没有可用的截图，无法回放"}">▶ 回放</button>
             <button class="ghost sm danger" data-del="${s.id}" title="删除该记录及其截图/日志">删除</button>
           </span>
-        </div>`).join("") || "<div class='lt-empty'>还没有记录。用 <code>session.py start</code> 开启会话后由 AI 执行用例。</div>"}
+        </div>`).join("") || (q
+          ? `<div class='lt-empty'>没有标题或结论匹配“${esc(recQuery.trim())}”的记录。</div>`
+          : "<div class='lt-empty'>还没有记录。用 <code>session.py start</code> 开启会话后由 AI 执行用例。</div>")}
     </div>`;
+
+  // 搜索框：停止输入 1 秒自动搜索；清空后立即回到全部列表
+  const searchEl = $("#rec-search");
+  if (searchEl) {
+    searchEl.addEventListener("input", () => {
+      recQuery = searchEl.value;
+      if (recSearchTimer) { clearTimeout(recSearchTimer); recSearchTimer = null; }
+      // 清空：无需等待，立刻恢复全部列表
+      if (!recQuery.trim()) { viewSessions(); return; }
+      recSearchTimer = setTimeout(() => { recSearchTimer = null; viewSessions(); }, 1000);
+    });
+    // 回车仍可立即搜索（不等待防抖）
+    searchEl.addEventListener("keydown", ev => {
+      if (ev.key === "Enter") {
+        if (recSearchTimer) { clearTimeout(recSearchTimer); recSearchTimer = null; }
+        recQuery = searchEl.value;
+        viewSessions();
+      }
+    });
+    // 重渲染后把光标放回输入框末尾，避免连续输入被打断
+    if (recQuery) {
+      searchEl.focus();
+      try { searchEl.setSelectionRange(searchEl.value.length, searchEl.value.length); } catch {}
+    }
+  }
 
   const cb = $("#show-diag");
   if (cb) cb.addEventListener("change", () => { showDiag = cb.checked; viewSessions(); });
+  // 结论筛选：点击切换该状态（多选），再次点击取消；空=显示全部
+  $$(".stab", main).forEach(btn =>
+    btn.addEventListener("click", () => {
+      const st = btn.dataset.st;
+      const i = recStatusFilter.indexOf(st);
+      if (i >= 0) recStatusFilter.splice(i, 1);
+      else recStatusFilter.push(st);
+      viewSessions();
+    }));
+  const clr = $("#rec-flt-clear");
+  if (clr) clr.addEventListener("click", () => { recStatusFilter = []; viewSessions(); });
+  // 主题切换按钮（与「正式测试」同一行）
+  $$("[data-theme-toggle]").forEach(b =>
+    b.addEventListener("click", () => { toggleTheme(); syncThemeButtons(); }));
+  syncThemeButtons();
   $$(".row-link", main).forEach(el =>
     el.addEventListener("click", () => viewSession(el.dataset.id)));
   $$("[data-del]", main).forEach(el =>
@@ -375,6 +593,29 @@ async function viewSessions() {
       ev.stopPropagation();
       replaySession(el.dataset.replay);
     }));
+
+  // 批量删除：勾选框 → 「删除选中」按钮
+  const selAll = $("#rec-sel-all");
+  const batchBtn = $("#rec-batch-del");
+  const checkedIds = () => $$(".rec-check:checked", main).map(el => el.dataset.id);
+  const syncBatch = () => {
+    const ids = checkedIds();
+    if (batchBtn) {
+      batchBtn.disabled = !ids.length;
+      batchBtn.textContent = ids.length ? `🗑 删除选中 (${ids.length})` : "🗑 删除选中";
+    }
+    if (selAll) selAll.checked = ids.length > 0 &&
+      ids.length === $$(".rec-check", main).length;
+  };
+  $$(".rec-check", main).forEach(el => el.addEventListener("change", syncBatch));
+  if (selAll) selAll.addEventListener("change", () => {
+    $$(".rec-check", main).forEach(el => { el.checked = selAll.checked; });
+    syncBatch();
+  });
+  if (batchBtn) batchBtn.addEventListener("click", () => {
+    const ids = checkedIds();
+    if (ids.length) confirmDeleteSessions(ids);
+  });
 }
 
 function confirmDeleteSession(id) {
@@ -397,6 +638,37 @@ function confirmDeleteSession(id) {
     if (r && r.files != null) {
       toast(`已删除记录 #${id}${withEv ? `，清理 ${r.files} 个证据文件` : ""}`);
     }
+  });
+}
+
+function confirmDeleteSessions(ids) {
+  const m = modal("批量删除测试记录", `
+    <div class="warn-text">确定删除 <b>${ids.length}</b> 条记录吗？</div>
+    <div class="meta">将同时删除这些记录的事件流、断言，以及<b>磁盘上的截图与日志证据</b>，<b>不可恢复</b>。
+    被测 App 本身不受影响。</div>
+    <label class="chk" style="margin-top:10px">
+      <input type="checkbox" id="del-ev-b" checked> 同时删除截图 / 日志文件
+    </label>`,
+    `<button class="ghost" data-cancel>取消</button>
+     <button class="danger" data-ok>确认删除</button>`);
+  $("[data-cancel]", m.el).addEventListener("click", m.close);
+  $("[data-ok]", m.el).addEventListener("click", async () => {
+    const withEv = $("#del-ev-b", m.el).checked;
+    const okBtn = $("[data-ok]", m.el);
+    okBtn.disabled = true; okBtn.textContent = "删除中…";
+    let okN = 0, failN = 0, files = 0;
+    for (const id of ids) {
+      try {
+        const r = await api(`/api/sessions/${id}?evidence=${withEv ? 1 : 0}`,
+                            { method: "DELETE" });
+        if (r && r.ok) { okN++; if (r.files != null) files += r.files; }
+        else failN++;
+      } catch { failN++; }
+    }
+    m.close();
+    await viewSessions();
+    toast(`批量删除完成：成功 ${okN} 条${failN ? `，失败 ${failN} 条` : ""}` +
+          (withEv && files ? `，清理 ${files} 个证据文件` : ""));
   });
 }
 
@@ -446,10 +718,13 @@ async function replaySession(id) {
           <option value="500">2×</option>
           <option value="250">4×</option>
         </select>
+        <button class="ghost rp-recenter" data-rp="recenter" title="把窗口移回屏幕中央">⌖</button>
       </div>
       ${data.missing ? `<div class="rp-warn">⚠️ ${data.missing} 帧的截图已被清理，播放时显示占位</div>` : ""}
     </div>`);
   m.el.querySelector(".modal").classList.add("rp-modal");   // 宽版，图才看得清
+  const drag = makeDraggable(m.el.querySelector(".modal"));
+  $("[data-rp='recenter']", m.el).addEventListener("click", () => drag.reset());
 
   const img = $(".rp-img", m.el);
   const dot = $(".rp-dot", m.el);
@@ -462,6 +737,13 @@ async function replaySession(id) {
 
   let i = 0;
   let timer = null;
+  let rewindTimer = null;          // 播完后"回到起点"的延时器
+  const END_HOLD_MS = 900;         // 末帧停留时长，让最后一帧看得清再回起点
+
+  // 播完后若用户已手动拖拽/翻帧，就不要再把它拉回起点
+  function cancelRewind() {
+    if (rewindTimer) { clearTimeout(rewindTimer); rewindTimer = null; }
+  }
 
   function show(n) {
     i = Math.max(0, Math.min(data.total - 1, n));
@@ -490,6 +772,8 @@ async function replaySession(id) {
 
     // 字幕条（在图下方，**不遮挡画面**）
     const parts = [`<span class="rp-sub-n">第 ${f.seq} 步</span>`];
+    // 真实时间戳：与「执行录屏」同一时间轴，便于核对两者是否对齐
+    if (f.ts) parts.push(`<code>${esc(fmtTime(f.ts))}</code>`);
     if (f.kind === "act") {
       parts.push(`<b>${esc(f.action || "操作")}</b>`);
       if (f.x != null) parts.push(`<code>${f.x}, ${f.y}</code>`);
@@ -508,31 +792,39 @@ async function replaySession(id) {
   }
   function play() {
     if (timer) { stop(); return; }
+    // 已停在末帧时再点播放：先回到起点，否则一点就立刻"播完"
+    if (i >= data.total - 1) show(0);
     playBtn.textContent = "⏸";
     const tick = () => {
-      if (i >= data.total - 1) { stop(); return; }
+      if (i >= data.total - 1) {
+        // 播到最后一帧：先停，稍作停留让末帧看得清，再**自动回到起点**
+        // （进度条回到起点 → 可直接再次点播放重看，不用手动拖回去）
+        stop();
+        rewindTimer = setTimeout(() => { rewindTimer = null; show(0); }, END_HOLD_MS);
+        return;
+      }
       show(i + 1);
     };
     timer = setInterval(tick, Number(speedSel.value));
   }
 
-  $("[data-rp='prev']", m.el).addEventListener("click", () => { stop(); show(i - 1); });
-  $("[data-rp='next']", m.el).addEventListener("click", () => { stop(); show(i + 1); });
+  $("[data-rp='prev']", m.el).addEventListener("click", () => { stop(); cancelRewind(); show(i - 1); });
+  $("[data-rp='next']", m.el).addEventListener("click", () => { stop(); cancelRewind(); show(i + 1); });
   playBtn.addEventListener("click", play);
-  range.addEventListener("input", () => { stop(); show(Number(range.value) - 1); });
+  range.addEventListener("input", () => { stop(); cancelRewind(); show(Number(range.value) - 1); });
   speedSel.addEventListener("change", () => { if (timer) { stop(); play(); } });
 
   // 键盘：← → 翻帧，空格播放/暂停
   const onKey = ev => {
     if (!document.body.contains(m.el)) { document.removeEventListener("keydown", onKey); return; }
-    if (ev.key === "ArrowLeft") { stop(); show(i - 1); }
-    else if (ev.key === "ArrowRight") { stop(); show(i + 1); }
+    if (ev.key === "ArrowLeft") { stop(); cancelRewind(); show(i - 1); }
+    else if (ev.key === "ArrowRight") { stop(); cancelRewind(); show(i + 1); }
     else if (ev.key === " ") { ev.preventDefault(); play(); }
   };
   document.addEventListener("keydown", onKey);
 
   const origClose = $(".modal-x", m.el);
-  origClose.addEventListener("click", stop);
+  origClose.addEventListener("click", () => { stop(); cancelRewind(); });
   show(0);
 }
 
@@ -573,21 +865,40 @@ async function viewSession(id) {
         开始 ${esc(fmtTime(s.started_at))} → 结束 ${esc(fmtTime(s.finished_at))} · 耗时 ${fmtDuration(durationOf(s))}</div>
       ${s.user_input ? `<div class="quote">用例口述：${esc(s.user_input)}</div>` : ""}
       <div class="findings">
-        ${s.findings.map(f => `
-          <div class="finding">${statusChip(f.status)}
-            ${f.expect ? `<b>期望</b>${esc(f.expect)}` : ""}
-            ${f.actual ? `<span class="small">　实际：${esc(f.actual)}</span>` : ""}
-            ${f.note ? `<div class="small">${esc(f.note)}</div>` : ""}
-            ${(f.event_ids || []).length ? `<div class="small">证据：
-              ${f.event_ids.map(id => `<a href="#event-${s.id}-${id}">事件 ${esc(id)}</a>`).join(" · ")}
-            </div>` : ""}
-          </div>`).join("") || "<span class='muted'>无断言记录</span>"}
+        ${(() => {
+          // 期望校验模块：每个用例有多少条「期望」，就展示多少块。
+          // 将每个 finding 的 expect 按 ；/;/换行 拆成单条期望，逐条渲染为一个模块；
+          // 复跑时若已按单条预期分别建 finding，则天然 1 条预期 = 1 块。
+          const items = [];
+          for (const f of (s.findings || [])) {
+            let exps = (f.expect || "").split(/[；;\n]+/).map(x => x.trim()).filter(Boolean);
+            if (exps.length === 0) exps = [""];
+            exps.forEach((txt, k) => items.push({
+              idx: k + 1, text: txt, status: f.status,
+              actual: f.actual, note: f.note, event_ids: f.event_ids || []
+            }));
+          }
+          if (!items.length) return "<span class='muted'>无断言记录</span>";
+          return `<div class="exp-title">期望校验（共 ${items.length} 项）</div>` + items.map(e => `
+            <div class="finding">${statusChip(e.status)}
+              <span class="exp-idx">期望 ${e.idx}</span>${e.text ? esc(e.text) : '<span class="muted">（无明确期望文本）</span>'}
+              ${e.actual ? `<div class="small">实际：${esc(e.actual)}</div>` : ""}
+              ${e.note ? `<div class="small">${esc(e.note)}</div>` : ""}
+              ${e.event_ids.length ? `<div class="small">证据：${e.event_ids.map(id => `<a href="#event-${s.id}-${id}">事件 ${esc(id)}</a>`).join(" · ")}</div>` : ""}
+            </div>`).join("");
+        })()}
       </div>
     </div>
     <div class="final-result">
       <span class="final-label">最终结果</span>${statusChip(s.status)}
       <span class="final-summary">${esc(s.summary || (s.status === "running" ? "执行中…" : "未写结论"))}</span>
     </div>
+    ${s.recording ? `
+    <h1 style="font-size:16px;margin:18px 0 12px">执行录屏 <span class="rec-dur"></span></h1>
+    <div class="rec-wrap">
+      <video class="rec-video" controls preload="metadata"
+        src="/files/${esc(s.recording)}"></video>
+    </div>` : ""}
     <h1 style="font-size:16px;margin:18px 0 12px">执行时间线</h1>
     <div class="timeline">
       ${s.events.map(e => {
@@ -631,6 +942,12 @@ async function viewSession(id) {
   $(".back", main).addEventListener("click", viewSessions);
   const rpBtn = $("[data-replay]", main);
   if (rpBtn) rpBtn.addEventListener("click", () => replaySession(s.id));
+  // 执行录屏：视频元数据就绪后显示真实时长，便于与「耗时 / 轨迹回放」核对
+  const recVid = $(".rec-video", main);
+  if (recVid) recVid.addEventListener("loadedmetadata", () => {
+    const span = $(".rec-dur", main);
+    if (span && recVid.duration) span.textContent = "· 时长 " + fmtDuration(recVid.duration);
+  });
   $$("img.shot", main).forEach(img =>
     img.addEventListener("click", () => {
       $("#lightbox-img").src = img.src;
